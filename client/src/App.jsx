@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
+import { LandingPage } from './pages/LandingPage';
 import { FreeCheckPage } from './pages/FreeCheckPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { PropertiesPage } from './pages/PropertiesPage';
@@ -13,7 +14,7 @@ import { api } from './services/api';
 import { RefreshCw, ShieldAlert } from 'lucide-react';
 
 function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('landing');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -77,12 +78,12 @@ function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-white space-y-4">
+      <div className="min-h-screen bg-[#0F172A] flex flex-col items-center justify-center text-white space-y-4">
         <div className="w-12 h-12 rounded-2xl bg-sky-600 flex items-center justify-center animate-bounce">
           <RefreshCw className="w-6 h-6 animate-spin text-white" />
         </div>
         <div className="text-center">
-          <h2 className="text-lg font-bold">LandlordReady Autopilot</h2>
+          <h2 className="text-lg font-serif font-bold">LandlordReady Autopilot</h2>
           <p className="text-xs text-slate-400">Loading statutory compliance engine...</p>
         </div>
       </div>
@@ -90,7 +91,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
+    <div className="min-h-screen bg-[#FAF9F5] flex flex-col font-sans">
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -115,6 +116,12 @@ function App() {
               </button>
             </div>
           </div>
+        )}
+
+        {activeTab === 'landing' && (
+          <LandingPage
+            setActiveTab={setActiveTab}
+          />
         )}
 
         {activeTab === 'free-check' && (

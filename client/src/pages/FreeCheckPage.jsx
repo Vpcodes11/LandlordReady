@@ -116,16 +116,16 @@ export function FreeCheckPage({ setActiveTab, onCompleteSave }) {
   return (
     <div className="max-w-4xl mx-auto px-4 py-8">
       {/* Intro Header */}
-      <div className="text-center max-w-2xl mx-auto mb-8">
-        <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-sky-50 text-sky-700 border border-sky-200 mb-3">
-          <ShieldCheck className="w-3.5 h-3.5 text-sky-600" />
-          <span>Free 2-Minute Diagnostic • England Tenancies Only</span>
+      <div className="text-center max-w-2xl mx-auto mb-10 space-y-3">
+        <div className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 rounded-full text-xs font-semibold bg-white border border-slate-200 shadow-sm text-slate-800">
+          <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+          <span>2-Minute Diagnostic • England Housing Law Verified</span>
         </div>
-        <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">
+        <h1 className="text-4xl sm:text-5xl font-serif font-extrabold text-slate-950 tracking-tight leading-tight">
           "Am I Compliant?"
         </h1>
-        <p className="mt-2 text-slate-600 text-sm leading-relaxed">
-          Check your properties against the <strong>Renters' Rights Act 2025/2026</strong> and all statutory safety obligations in England. Get an instant score (0–100), plain-English fixes, and exact statutory penalties.
+        <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-xl mx-auto font-sans font-normal">
+          Audit your property against the <strong className="text-slate-900 font-semibold">Renters' Rights Act 2025/2026</strong> and recurring safety mandates. Get an instant score (0–100), plain-English remedies, and statutory penalty calculations.
         </p>
       </div>
 
