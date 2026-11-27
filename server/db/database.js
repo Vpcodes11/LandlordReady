@@ -18,7 +18,8 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const dbDir = path.join(__dirname, '../../data');
+// DATA_DIR should point at a persistent disk in production (e.g. /var/data on Render).
+const dbDir = process.env.DATA_DIR || path.join(__dirname, '../../data');
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
 }
@@ -34,6 +35,7 @@ export function initDatabase() {
   const schemaPath = path.join(__dirname, 'schema.sql');
   const schemaSql = fs.readFileSync(schemaPath, 'utf8');
   db.exec(schemaSql);
+  migrate();
 
   // Check if rules are seeded
   const rulesCount = db.prepare('SELECT COUNT(*) as count FROM rules').get().count;
@@ -69,9 +71,20 @@ export function initDatabase() {
     insertManyTmpl(SEED_TEMPLATES);
   }
 
-  // Check if profile exists
+  const updCount = db.prepare('SELECT COUNT(*) as count FROM regulation_updates').get().count;
+  if (updCount === 0) {
+    const insertUpd = db.prepare(`
+      INSERT INTO regulation_updates (id, title, summary, topic, effective_date, affected_regions, impact_severity, source_url, actions_required, broadcast_sent)
+      VALUES (@id, @title, @summary, @topic, @effective_date, @affected_regions, @impact_severity, @source_url, @actions_required, @broadcast_sent)
+    `);
+    for (const u of SEED_REGULATION_UPDATES) {
+      insertUpd.run(u);
+    }
+  }
+
+  // The demo landlord (fictional people, properties and tenants) is for local development only.
   const profileCount = db.prepare('SELECT COUNT(*) as count FROM profiles').get().count;
-  if (profileCount === 0) {
+  if (profileCount === 0 && process.env.SEED_DEMO === 'true') {
     console.log('[DB] Seeding default demo landlord profile and portfolio...');
     
     // Profile
@@ -116,14 +129,6 @@ export function initDatabase() {
       insertTask.run(tk);
     }
 
-    // Regulation Updates
-    const insertUpd = db.prepare(`
-      INSERT INTO regulation_updates (id, title, summary, topic, effective_date, affected_regions, impact_severity, source_url, actions_required, broadcast_sent)
-      VALUES (@id, @title, @summary, @topic, @effective_date, @affected_regions, @impact_severity, @source_url, @actions_required, @broadcast_sent)
-    `);
-    for (const u of SEED_REGULATION_UPDATES) {
-      insertUpd.run(u);
-    }
 
     // Subscriptions
     const insertSub = db.prepare(`
@@ -145,4 +150,34 @@ export function initDatabase() {
   }
 
   console.log('[DB] LandlordReady database initialized successfully.');
+}
+
+/** Adds tables and columns introduced after the first release (safe to run on every start). */
+function migrate() {
+  const cols = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  const add = (table, col, def) => {
+    if (!cols(table).includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  };
+  add('profiles', 'session_version', 'INTEGER DEFAULT 0');
+  add('profiles', 'billing_subscription_id', 'TEXT');
+  add('profiles', 'billing_customer_id', 'TEXT');
+  add('certificates', 'stored_file', 'TEXT');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS login_tokens (
+      token_hash TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS rate_limits (
+      key TEXT PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 0,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      id TEXT PRIMARY KEY,
+      type TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
 }

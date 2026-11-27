@@ -458,57 +458,6 @@ export function LandingPage({ setActiveTab }) {
         </div>
       </section>
 
-      {/* 6. LANDLORD TESTIMONIALS */}
-      <section className="py-20 bg-white border-b border-slate-200/80">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 space-y-12">
-          <div className="text-center space-y-2">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Trusted By Small Private Landlords</span>
-            <h2 className="text-3xl font-serif font-bold text-slate-950">What self-managers are saying</h2>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200/70 space-y-3">
-              <div className="flex text-amber-500 space-x-0.5 text-xs">
-                {'★'.repeat(5)}
-              </div>
-              <p className="text-xs text-slate-700 italic leading-relaxed">
-                "Saved me from serving an invalid rent increase. I didn't realize under the new rules rent review clauses are banned and you must use Form 4 with 2 months notice."
-              </p>
-              <div className="pt-2 text-xs">
-                <strong className="block text-slate-900">David Reynolds</strong>
-                <span className="text-slate-400 text-[11px]">3 properties in Manchester</span>
-              </div>
-            </div>
-
-            <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200/70 space-y-3">
-              <div className="flex text-amber-500 space-x-0.5 text-xs">
-                {'★'.repeat(5)}
-              </div>
-              <p className="text-xs text-slate-700 italic leading-relaxed">
-                "My buy-to-let mortgage lender asked for proof of compliance before remortgaging. I exported the LandlordReady Compliance Pack PDF and got approval the next morning."
-              </p>
-              <div className="pt-2 text-xs">
-                <strong className="block text-slate-900">Claire Thornton</strong>
-                <span className="text-slate-400 text-[11px]">2 flats in Islington, London</span>
-              </div>
-            </div>
-
-            <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200/70 space-y-3">
-              <div className="flex text-amber-500 space-x-0.5 text-xs">
-                {'★'.repeat(5)}
-              </div>
-              <p className="text-xs text-slate-700 italic leading-relaxed">
-                "The 'Can I Do This?' assistant gives immediate clarity. Knowing exactly when I can manage it myself vs when to instruct a solicitor is priceless."
-              </p>
-              <div className="pt-2 text-xs">
-                <strong className="block text-slate-900">Dr. Simon Ward</strong>
-                <span className="text-slate-400 text-[11px]">4 properties in Bristol</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       {/* 7. FINAL CALL TO ACTION */}
       <section className="py-20 text-center max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 space-y-6">
         <h2 className="text-3xl sm:text-5xl font-serif font-extrabold text-slate-950 tracking-tight">

@@ -11,16 +11,26 @@ async function request(url, options = {}) {
     }
   });
 
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
   if (!response.ok || data.success === false) {
     const error = new Error(data.error || 'An unexpected error occurred');
     error.data = data;
+    error.status = response.status;
     throw error;
   }
   return data;
 }
 
 export const api = {
+  // Session
+  me: () => request(`${API_BASE}/me`),
+  requestLogin: (email) => request(`${API_BASE}/auth/request`, { method: 'POST', body: JSON.stringify({ email }) }),
+  logout: () => request(`${API_BASE}/auth/logout`, { method: 'POST' }),
+
+  // Billing (Dodo Payments)
+  checkout: (plan_id, billing_cycle) => request(`${API_BASE}/billing/checkout`, { method: 'POST', body: JSON.stringify({ plan_id, billing_cycle }) }),
+  billingPortal: () => request(`${API_BASE}/billing/portal`, { method: 'POST' }),
+
   // Rules
   getRules: () => request(`${API_BASE}/rules`),
 
@@ -40,10 +50,6 @@ export const api = {
   updateProfile: (profile) => request(`${API_BASE}/profile`, {
     method: 'PUT',
     body: JSON.stringify(profile)
-  }),
-  upgradeSubscription: (plan_id, billing_cycle) => request(`${API_BASE}/subscriptions/upgrade`, {
-    method: 'POST',
-    body: JSON.stringify({ plan_id, billing_cycle })
   }),
   getOrders: () => request(`${API_BASE}/orders`),
 
@@ -81,7 +87,9 @@ export const api = {
       method: 'POST',
       body: formData
     });
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) throw new Error(data.error || 'Upload failed');
+    return data;
   },
 
   // Compliance Calendar & Tasks

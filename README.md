@@ -94,29 +94,22 @@ The system uses SQLite via `better-sqlite3` stored in `data/landlordready.db` wi
 
 ---
 
-## 🚀 Running the Project
+## 🚀 Deploy (Render, with a persistent disk)
 
-### Prerequisites
-- Node.js (v18+)
+LandlordReady is one Node server (API + built React app) with SQLite. The database and uploaded certificates live in `DATA_DIR`, which **must be a persistent disk** (serverless hosts like Vercel are not suitable).
 
-### Development Mode (Concurrent Server & Client)
+1. Render → New → **Blueprint** → choose this repo. `render.yaml` creates the web service with a 1 GB disk at `/var/data` and generates `SESSION_SECRET` and `HEALTH_KEY`.
+2. Fill in the remaining settings (see `.env.example`): `APP_URL`, Resend (`RESEND_API_KEY`, `EMAIL_FROM` on a verified domain), `ADMIN_EMAILS`, and Dodo Payments.
+3. **Dodo Payments**: create six GBP subscription products (Starter £7/£70, Portfolio £19/£190, Pro £39/£390, monthly/annual) with **no trial** (the app gives the 14-day trial), put their IDs in `DODO_PRODUCT_*`, and add a webhook to `https://YOUR-DOMAIN/api/billing/webhook` for all `subscription.*` events.
+4. Open `https://YOUR-DOMAIN/api/health?key=YOUR_HEALTH_KEY` to see any missing settings.
+
+Reminder emails (60/30/7 days and overdue) are sent by the server itself every hour; no cron needed.
+
+## 💻 Local development
+
 ```bash
-# Run server on port 5000 and client on port 5173 concurrently:
-npm run dev
+npm install && npm --prefix client install
+cp .env.example .env
+npm run dev        # API on :5000, client on :5173, fictional demo data loaded
+npm test           # integration tests on a throwaway database
 ```
-
-### Production Mode
-```bash
-# Build the client bundle:
-npm run build
-
-# Start the unified server (serves API on port 5000 and client frontend):
-npm start
-```
-Visit **http://localhost:5000** in your browser.
-
-### Run System Test Suite
-```bash
-node test_system.js
-```
-Runs 30 automated integration tests verifying rules seeding, compliance calculations, devolution gatekeeper, document generator, "Can I Do This?" assistant, and PDF pack exports.
