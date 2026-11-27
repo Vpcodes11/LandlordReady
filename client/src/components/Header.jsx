@@ -4,7 +4,7 @@ import {
   Bell, Home, Crown, Sparkles, Building2, Compass
 } from 'lucide-react';
 
-export function Header({ activeTab, setActiveTab, profile, subscription, overdueCount = 0 }) {
+export function Header({ activeTab, setActiveTab, profile, subscription, overdueCount = 0, signedIn = false, onSignOut }) {
   const navItems = [
     { id: 'landing', label: 'Overview', icon: Compass },
     { id: 'free-check', label: 'Am I Compliant?', icon: ShieldCheck, highlight: true },
@@ -17,7 +17,7 @@ export function Header({ activeTab, setActiveTab, profile, subscription, overdue
     { id: 'pricing', label: 'Pricing', icon: Crown }
   ];
 
-  const planName = (subscription?.plan_id || 'portfolio').toUpperCase();
+  const planName = subscription?.plan_id === 'trial' ? 'FREE TRIAL' : (subscription?.plan_id || 'free').toUpperCase();
 
   return (
     <header className="bg-[#0F172A] border-b border-slate-800 text-white sticky top-0 z-40 shadow-sm backdrop-blur-md">
@@ -26,23 +26,30 @@ export function Header({ activeTab, setActiveTab, profile, subscription, overdue
         <div className="flex items-center space-x-2">
           <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>
-            England Jurisdiction Verified
+            England only
           </span>
           <span className="text-slate-400 hidden sm:inline text-[11px]">
             Renters' Rights Act 2025/2026 Phase 1 (1 May 2026) & Safety Obligations
           </span>
         </div>
         <div className="flex items-center space-x-3">
-          <span className="text-slate-400 text-[11px] hidden md:inline">
-            Logged in: <strong className="text-slate-200">{profile?.name || 'Marcus Holloway'}</strong>
-          </span>
-          <button
-            onClick={() => setActiveTab('pricing')}
-            className="inline-flex items-center text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded-full hover:bg-amber-500/20 transition-colors"
-          >
-            <Sparkles className="w-2.5 h-2.5 mr-1" />
-            {planName} Plan ({subscription?.properties_limit || 5} Props)
-          </button>
+          {signedIn ? (
+            <>
+              <span className="text-slate-400 text-[11px] hidden md:inline">
+                Signed in: <strong className="text-slate-200">{profile?.name || profile?.email}</strong>
+              </span>
+              <button
+                onClick={() => setActiveTab('pricing')}
+                className="inline-flex items-center text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded-full hover:bg-amber-500/20 transition-colors"
+              >
+                <Sparkles className="w-2.5 h-2.5 mr-1" />
+                {planName} ({subscription?.properties_limit ?? 0} props)
+              </button>
+              <button onClick={onSignOut} className="text-[11px] text-slate-400 hover:text-white underline">Sign out</button>
+            </>
+          ) : (
+            <button onClick={() => setActiveTab('login')} className="text-[11px] font-semibold text-slate-200 hover:text-white underline">Sign in</button>
+          )}
         </div>
       </div>
 

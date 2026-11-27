@@ -1,217 +1,103 @@
-// Comprehensive System Verification Test for LandlordReady
+// Integration test: starts the real server on a throwaway database and exercises the API.
+//   node test_system.js
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
 
-import { app, server } from './server/server.js';
-import { db } from './server/db/database.js';
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lr-test-'));
+process.env.DATA_DIR = dataDir;
+process.env.PORT = process.env.PORT || '5099';
+process.env.SESSION_SECRET = 'test-secret-0123456789abcdef0123456789';
+const base = `http://localhost:${process.env.PORT}`;
 
-async function runTests() {
-  console.log('--- STARTING LANDLORDREADY SYSTEM TESTS ---');
-  let failures = 0;
+const { server } = await import('./server/server.js');
+const { db } = await import('./server/db/database.js');
 
-  function assert(condition, testName) {
-    if (condition) {
-      console.log(`✅ PASS: ${testName}`);
-    } else {
-      console.error(`❌ FAIL: ${testName}`);
-      failures++;
-    }
-  }
+let failures = 0;
+const assert = (cond, name) => {
+  console.log(`${cond ? '✅ PASS' : '❌ FAIL'}: ${name}`);
+  if (!cond) failures++;
+};
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
-  try {
-    const baseUrl = 'http://localhost:5000';
-
-    // 1. Health Endpoint
-    const healthRes = await (await fetch(`${baseUrl}/api/health`)).json();
-    assert(healthRes.status === 'ok' && healthRes.jurisdiction === 'England', 'Health endpoint reports England jurisdiction');
-
-    // 2. Rules Seeding & Required Verification
-    const rulesRes = await (await fetch(`${baseUrl}/api/rules`)).json();
-    assert(rulesRes.success && rulesRes.rules.length >= 12, 'Rules table contains 12+ statutory rules');
-
-    const requiredRuleTopics = [
-      'phase 1',
-      'information sheet',
-      'section 21',
-      'periodic',
-      'rent increase',
-      'pet',
-      'prs database',
-      'ombudsman',
-      'deposit',
-      'gas',
-      'eicr',
-      'epc',
-      'smoke'
-    ];
-
-    for (const topic of requiredRuleTopics) {
-      const found = rulesRes.rules.find(r => 
-        r.topic.toLowerCase().includes(topic) || 
-        r.id.toLowerCase().includes(topic) ||
-        r.rule.toLowerCase().includes(topic)
-      );
-      assert(
-        found && found.source_url.includes('gov.uk') && found.status === 'verified',
-        `Rule for "${topic}" is seeded with verified GOV.UK link: ${found?.source_url || 'missing'}`
-      );
-    }
-
-    // 3. Free "Am I compliant?" Check (England)
-    const checkPayloadEngland = {
-      country: 'England',
-      postcode: 'M14 5RT',
-      property_type: 'Terraced',
-      tenancy_start_date: '2025-06-01',
-      tenancy_type: 'periodic',
-      deposit_taken: true,
-      deposit_protected: true,
-      prescribed_info_given: true,
-      information_sheet_given: false, // Critical breach
-      has_gas: true,
-      gas_cert_date: '2025-01-10', // Expired
-      eicr_date: '2024-05-10',
-      epc_rating: 'D',
-      smoke_co_alarms: true,
-      is_hmo: false,
-      licensing_area: 'compliant',
-      rent_last_increased_date: '2025-01-10'
-    };
-
-    const checkRes = await (await fetch(`${baseUrl}/api/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(checkPayloadEngland)
-    })).json();
-
-    assert(checkRes.success && checkRes.evaluation.allowed === true, 'Free compliance check executed for England property');
-    assert(checkRes.evaluation.red_count >= 2, 'Correctly flags missing information sheet and expired Gas CP12 as RED breaches');
-    assert(checkRes.evaluation.red_items.some(r => r.penalty.includes('civil penalty') || r.penalty.includes('fine')), 'Red items include statutory penalties from rules table');
-
-    // Email capture for free check
-    const emailRes = await (await fetch(`${baseUrl}/api/check/email`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        check_id: checkRes.check_id,
-        email: 'landlord.lead@example.co.uk',
-        name: 'Sarah Jenkins'
-      })
-    })).json();
-    assert(emailRes.success, 'Email lead captured for compliance PDF report');
-
-    // Devolution Gatekeeper Check (Wales / Scotland / NI)
-    const checkWalesRes = await (await fetch(`${baseUrl}/api/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ country: 'Wales' })
-    })).json();
-    assert(
-      checkWalesRes.evaluation.jurisdiction_error === true && checkWalesRes.evaluation.message.includes('Renting Homes (Wales) Act'),
-      'Devolution gatekeeper stops for Wales with educational statutory explanation'
-    );
-
-    // 4. Properties & Compliance Pack
-    const propsRes = await (await fetch(`${baseUrl}/api/properties`)).json();
-    assert(propsRes.success && propsRes.properties.length >= 3, 'Multi-property dashboard fetches user properties');
-
-    const firstProp = propsRes.properties[0];
-    const packRes = await (await fetch(`${baseUrl}/api/properties/${firstProp.id}/pack`)).json();
-    assert(packRes.success && packRes.pack.property.id === firstProp.id, 'Compliance Pack data generated for lenders/insurers/tribunals');
-
-    // 5. Compliance Calendar & 60/30/7-day Reminders Simulation
-    const tasksRes = await (await fetch(`${baseUrl}/api/tasks`)).json();
-    assert(tasksRes.success && tasksRes.tasks.length > 0, 'Calendar tasks fetched with due dates');
-
-    const simRes = await (await fetch(`${baseUrl}/api/tasks/simulate-reminders`, { method: 'POST' })).json();
-    assert(simRes.success && Array.isArray(simRes.dispatches), 'Email reminders simulator processes 60/30/7-day windows');
-
-    // 6. Document Generator
-    const docGenRes = await (await fetch(`${baseUrl}/api/documents/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        template_slug: 'rent-increase-section13',
-        property_id: firstProp.id,
-        custom_values: { new_rent: '2,200.00', effective_date: '2027-02-01' }
-      })
-    })).json();
-    assert(
-      docGenRes.success && docGenRes.official_gov_url.includes('rent-increase-form-4'),
-      'Document generator renders Section 13 notice and provides official GOV.UK Form 4 link'
-    );
-
-    // 7. "Can I Do This?" Legal Assistant & Audit Log
-    const qaHikeRes = await (await fetch(`${baseUrl}/api/qa`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: 'Can I raise rent by 15% next month?',
-        property_id: firstProp.id
-      })
-    })).json();
-    assert(
-      qaHikeRes.success && qaHikeRes.result.answer.includes('Section 13') && qaHikeRes.result.answer.includes('2 full months'),
-      '"Can I Do This?" assistant cites Section 13 statutory 2-month notice window'
-    );
-
-    const qaS21Res = await (await fetch(`${baseUrl}/api/qa`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: 'Can I serve a Section 21 notice?',
-        property_id: firstProp.id
-      })
-    })).json();
-    assert(
-      qaS21Res.result.answer.includes('NO') && qaS21Res.result.solicitor_advised === 1,
-      'Assistant confirms Section 21 abolition and triggers solicitor instruction advisory'
-    );
-
-    const qaLogsRes = await (await fetch(`${baseUrl}/api/qa?property_id=${firstProp.id}`)).json();
-    assert(qaLogsRes.success && qaLogsRes.logs.length >= 2, 'All landlord Q&A queries persistently logged per property');
-
-    // 8. Regulation Updates & Automatic Task Creation
-    const broadcastRes = await (await fetch(`${baseUrl}/api/regulation-updates`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: 'PRS Database: Mandatory Rollout Test Decree',
-        summary: 'Mandatory landlord registration window testing decree.',
-        topic: 'PRS Database',
-        effective_date: '2026-11-25',
-        affected_regions: 'England',
-        impact_severity: 'high',
-        actions_required: ['Upload valid Gas CP12', 'Register on local portal']
-      })
-    })).json();
-    assert(
-      broadcastRes.success && broadcastRes.tasks_created_count > 0,
-      'Admin regulation broadcast automatically creates compliance tasks for user properties'
-    );
-
-    // 9. Pricing & Subscription Upgrade
-    const subRes = await (await fetch(`${baseUrl}/api/subscriptions/upgrade`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        plan_id: 'pro',
-        billing_cycle: 'annual'
-      })
-    })).json();
-    assert(subRes.success && subRes.limit === 15, 'Successfully upgraded to Pro annual plan with 15 property allowance');
-
-    const ordersRes = await (await fetch(`${baseUrl}/api/orders`)).json();
-    assert(ordersRes.success && ordersRes.orders.length > 0, 'Invoices and order history recorded');
-
-    // 10. Frontend Production HTML Serving
-    const htmlRes = await (await fetch(`${baseUrl}/`)).text();
-    assert(htmlRes.includes('<!doctype html>') && htmlRes.includes('/assets/'), 'Server serves frontend production bundle');
-
-    console.log(`\n--- TEST RESULTS: ${failures === 0 ? 'ALL PASSED (30/30)!' : `${failures} FAILURES`} ---`);
-    process.exit(failures === 0 ? 0 : 1);
-  } catch (err) {
-    console.error('Fatal test error:', err);
-    process.exit(1);
-  }
+async function signIn(email) {
+  const token = crypto.randomBytes(16).toString('hex');
+  db.prepare('INSERT INTO login_tokens (token_hash, email, expires_at) VALUES (?, ?, ?)').run(sha(token), email, Date.now() + 60000);
+  const res = await fetch(`${base}/api/auth/verify`, { method: 'POST', body: new URLSearchParams({ token }), redirect: 'manual' });
+  return res.headers.get('set-cookie').split(';')[0];
 }
+const client = (cookie) => async (p, opts = {}) => {
+  const headers = { ...(cookie ? { cookie } : {}), ...(opts.body && typeof opts.body === 'string' ? { 'Content-Type': 'application/json' } : {}) };
+  const res = await fetch(`${base}${p}`, { ...opts, headers });
+  const type = res.headers.get('content-type') || '';
+  return { status: res.status, body: type.includes('json') ? await res.json() : null };
+};
 
-runTests();
+try {
+  await new Promise((r) => setTimeout(r, 300));
+  const anon = client(null);
+  const rules = await anon('/api/rules');
+  assert(rules.body.rules?.length >= 12, 'Rules seeded (12+)');
+  assert(db.prepare('SELECT COUNT(*) c FROM profiles').get().c === 0, 'No demo landlord in a fresh database');
+
+  const check = await anon('/api/check', { method: 'POST', body: JSON.stringify({ postcode: 'LS1 1AA' }) });
+  assert(check.status === 200 && typeof check.body.evaluation?.score === 'number', 'Free check works without an account');
+  assert((await anon('/api/properties')).status === 401, 'Properties need sign-in');
+
+  const aCookie = await signIn('a@test.dev');
+  const bCookie = await signIn('b@test.dev');
+  const a = client(aCookie);
+  const b = client(bCookie);
+  const me = await a('/api/me');
+  assert(me.body.plan === 'trial' && me.body.properties_limit === 5, 'New account starts on the 14-day trial');
+
+  const prop = await a('/api/properties', { method: 'POST', body: JSON.stringify({ address_line1: '1 Test St', city: 'Leeds', postcode: 'ls1 1aa' }) });
+  assert(prop.status === 200 && prop.body.property.postcode === 'LS1 1AA', 'Landlord A adds a property');
+  const pid = prop.body.property.id;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const tasks = (await a(`/api/tasks?property_id=${pid}`)).body.tasks;
+  assert(tasks.length === 4 && tasks.every((t) => t.due_date > today), 'Starter tasks are dated from today');
+
+  assert((await b(`/api/properties/${pid}/pack`)).status === 404, "Landlord B cannot read A's property");
+  assert((await b(`/api/properties/${pid}`, { method: 'DELETE' })).status === 404, "Landlord B cannot delete A's property");
+  assert((await b('/api/tasks')).body.tasks.length === 0, "Landlord B sees none of A's tasks");
+  assert((await b('/api/tenancies', { method: 'POST', body: JSON.stringify({ property_id: pid, start_date: today, rent_amount: 900, tenants: [{ name: 'X' }] }) })).status === 404, "Landlord B cannot add a tenancy to A's property");
+
+  const ten = await a('/api/tenancies', { method: 'POST', body: JSON.stringify({ property_id: pid, start_date: today, rent_amount: 1200, deposit_amount: 1300, tenants: [{ name: 'Jo Bloggs' }] }) });
+  assert(ten.status === 200, 'Tenancy added');
+  const types = (await a(`/api/tasks?property_id=${pid}`)).body.tasks.map((t) => t.type);
+  assert(types.includes('deposit_prescribed_info') && types.includes('information_sheet'), 'Deposit and information-sheet tasks created when not yet done');
+
+  const templates = (await anon('/api/templates')).body.templates;
+  const doc = await a('/api/documents/generate', { method: 'POST', body: JSON.stringify({ template_slug: templates[0].slug, property_id: pid }) });
+  const content = doc.body.document?.content || '';
+  assert(doc.status === 200 && !content.includes('Camden') && !content.includes('2,050'), 'Documents contain no invented addresses or evidence');
+  assert(content.includes('1 Test St'), 'Documents use the real property address');
+
+  const qa = await a('/api/qa', { method: 'POST', body: JSON.stringify({ question: 'Can I increase the rent?' }) });
+  assert(qa.status === 200 && Boolean(qa.body.result?.answer), '"Can I do this?" answers');
+  assert((await b('/api/qa')).body.logs.length === 0, 'Q&A history is private');
+
+  const fd = new FormData();
+  fd.append('file', new Blob(['%PDF-1.4 test'], { type: 'application/pdf' }), 'gas.pdf');
+  const up = await client(aCookie)('/api/certificates/upload', { method: 'POST', body: fd });
+  assert(up.status === 200 && up.body.file_path?.startsWith('/api/files/'), 'Certificate upload is stored privately');
+  assert((await client(aCookie)(up.body.file_path)).status === 200, 'Owner can download the file');
+  assert((await client(bCookie)(up.body.file_path)).status === 404, "Another landlord can't download it");
+  assert((await anon(up.body.file_path)).status === 401, "Anonymous visitors can't download it");
+
+  db.prepare("UPDATE profiles SET trial_ends_at = '2000-01-01' WHERE email = 'a@test.dev'").run();
+  assert((await a('/api/properties', { method: 'POST', body: JSON.stringify({ address_line1: '2 Test St', city: 'Leeds', postcode: 'LS1' }) })).status === 402, 'Writing needs a plan once the trial ends');
+  assert((await a('/api/properties')).status === 200, 'Data stays readable after the trial');
+  assert((await a('/api/regulation-updates', { method: 'POST', body: JSON.stringify({ title: 'x' }) })).status === 403, 'Only admins publish regulation updates');
+} catch (e) {
+  console.error(e);
+  failures++;
+} finally {
+  server.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  console.log(failures ? `\n${failures} test(s) failed` : '\nAll tests passed');
+  process.exit(failures ? 1 : 0);
+}

@@ -54,7 +54,7 @@ export function PropertiesPage({ properties, onRefresh, subscription, setActiveT
     deposit_amount: '2134',
     deposit_scheme: 'Deposit Protection Service (DPS Custodial)',
     deposit_ref: 'DPS-NEW-' + Math.floor(Math.random() * 899999 + 100000),
-    prescribed_info_given: true
+    prescribed_info_given: false
   });
 
   const activeProperty = properties.find(p => p.id === selectedPropertyId) || properties[0];

@@ -1,64 +1,84 @@
 import express from 'express';
-import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import apiRouter from './routes/api.js';
-import { initDatabase } from './db/database.js';
+import { initDatabase, db } from './db/database.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-// Enable CORS and JSON parsing
-app.use(cors());
-app.use(express.json());
-
-// Initialize Database & Seed data
+// Database first: the routers below prepare statements against it.
 initDatabase();
 
-// Serve uploaded document files
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-app.use('/uploads', express.static(uploadsDir));
+const { default: apiRouter } = await import('./routes/api.js');
+const { accountRouter, billingWebhook, verifyPage } = await import('./routes/account.js');
+const { sendDueReminders } = await import('./lib/reminders.js');
 
-// API routes
-app.use('/api', apiRouter);
-
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    system: 'LandlordReady Compliance Engine',
-    version: '1.0.0',
-    jurisdiction: 'England',
-    renters_rights_act_phase: 'Phase 1 (1 May 2026)',
-    time: new Date().toISOString()
-  });
+const app = express();
+const PORT = process.env.PORT || 5000;
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  next();
 });
 
-// Serve frontend in production build if present
+// Webhook needs the raw body for its signature, so it is registered before the JSON parser.
+app.post('/api/billing/webhook', express.raw({ type: '*/*', limit: '1mb' }), billingWebhook);
+app.use(express.json({ limit: '1mb' }));
+
+// Health: public status; with ?key=HEALTH_KEY it lists missing settings (never values).
+app.get('/api/health', (req, res) => {
+  let database = false;
+  try {
+    db.prepare('SELECT 1').get();
+    database = true;
+  } catch {}
+  const secret = process.env.HEALTH_KEY;
+  if (!secret || req.query.key !== secret) return res.status(database ? 200 : 503).json({ ok: database });
+  const has = (n) => Boolean(process.env[n]);
+  const checks = {
+    database: database,
+    DATA_DIR_persistent: has('DATA_DIR'),
+    APP_URL: (process.env.APP_URL || '').startsWith('https://'),
+    SESSION_SECRET: (process.env.SESSION_SECRET || '').length >= 32,
+    RESEND_API_KEY: has('RESEND_API_KEY'),
+    EMAIL_FROM: has('EMAIL_FROM'),
+    DODO_PAYMENTS_API_KEY: has('DODO_PAYMENTS_API_KEY'),
+    DODO_PAYMENTS_WEBHOOK_KEY: has('DODO_PAYMENTS_WEBHOOK_KEY'),
+    products: ['STARTER', 'PORTFOLIO', 'PRO'].every((p) => has(`DODO_PRODUCT_${p}_MONTHLY`) && has(`DODO_PRODUCT_${p}_ANNUAL`)),
+    ADMIN_EMAILS: has('ADMIN_EMAILS'),
+  };
+  res.json({ ready: Object.values(checks).every(Boolean), checks, dodo_mode: process.env.DODO_PAYMENTS_ENVIRONMENT === 'live_mode' ? 'live' : 'test' });
+});
+
+app.get('/auth/verify', verifyPage);
+app.use('/api', accountRouter);
+app.use('/api', apiRouter);
+
+// Frontend (built React app)
 const clientDist = path.join(__dirname, '../client/dist');
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
-      return next();
-    }
-    const indexHtml = path.join(clientDist, 'index.html');
-    if (fs.existsSync(indexHtml)) {
-      return res.sendFile(indexHtml);
-    }
-    next();
+    if (req.path.startsWith('/api')) return next();
+    res.sendFile(path.join(clientDist, 'index.html'));
   });
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`🚀 LandlordReady server listening on http://localhost:${PORT}`);
-});
+// Reminder emails: hourly check (each stage is sent once per task).
+const runReminders = () => sendDueReminders().then((n) => n && console.log(`[reminders] sent ${n}`)).catch((e) => console.error('[reminders]', e.message));
+if (process.env.NODE_ENV === 'production' || process.env.SEND_REMINDERS === 'true') {
+  setTimeout(runReminders, 60_000);
+  setInterval(runReminders, 60 * 60_000);
+}
+// Expired sign-in tokens and rate-limit rows.
+setInterval(() => {
+  db.prepare('DELETE FROM login_tokens WHERE expires_at < ?').run(Date.now() - 86400000);
+  db.prepare('DELETE FROM rate_limits WHERE expires_at < ?').run(Date.now());
+}, 6 * 60 * 60_000);
 
+const server = app.listen(PORT, () => console.log(`LandlordReady listening on http://localhost:${PORT}`));
 export { app, server };

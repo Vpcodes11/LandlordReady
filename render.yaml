@@ -1,0 +1,51 @@
+# Render Blueprint: New → Blueprint → pick this repo. Creates the web service with a persistent disk
+# (the SQLite database and uploaded certificates live on it). Fill in the "sync: false" values in the dashboard.
+services:
+  - type: web
+    name: landlordready
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm --prefix client ci && npm run build
+    startCommand: node server/server.js
+    healthCheckPath: /api/health
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATA_DIR
+        value: /var/data
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: HEALTH_KEY
+        generateValue: true
+      - key: APP_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: DODO_PAYMENTS_ENVIRONMENT
+        value: test_mode
+      - key: DODO_PAYMENTS_API_KEY
+        sync: false
+      - key: DODO_PAYMENTS_WEBHOOK_KEY
+        sync: false
+      - key: DODO_PRODUCT_STARTER_MONTHLY
+        sync: false
+      - key: DODO_PRODUCT_STARTER_ANNUAL
+        sync: false
+      - key: DODO_PRODUCT_PORTFOLIO_MONTHLY
+        sync: false
+      - key: DODO_PRODUCT_PORTFOLIO_ANNUAL
+        sync: false
+      - key: DODO_PRODUCT_PRO_MONTHLY
+        sync: false
+      - key: DODO_PRODUCT_PRO_ANNUAL
+        sync: false

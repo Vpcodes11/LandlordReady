@@ -2,1035 +2,600 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../db/database.js';
 import { evaluateCompliance } from '../utils/complianceEngine.js';
 import { answerLandlordQuestion } from '../utils/canIDoThisAssistant.js';
+import { requireAuth, requirePlan, effectivePlan, PLAN_LIMITS, currentUser, rateLimit } from '../lib/auth.js';
+import { certificateStatus, taskStatus, daysUntil, refreshStatuses, today } from '../lib/reminders.js';
 
 const router = express.Router();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// ----------------------------------------------------
+// Private file storage (certificates). Never served statically: see GET /files/:name.
+// ----------------------------------------------------
+const dataDir = process.env.DATA_DIR || path.join(path.dirname(new URL(import.meta.url).pathname), '../../data');
+export const uploadsDir = path.join(dataDir, 'uploads');
+fs.mkdirSync(uploadsDir, { recursive: true });
 
-// Configure Multer for document vault uploads
-const uploadsDir = path.join(__dirname, '../uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadsDir);
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
-    cb(null, `${base}-${Date.now()}${ext}`);
-  }
+const ALLOWED = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.heic', '.webp']);
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadsDir),
+    // The owner's id is part of the name, so ownership can be checked on download.
+    filename: (req, file, cb) => cb(null, `${req.user.id}__${crypto.randomBytes(12).toString('hex')}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => cb(null, ALLOWED.has(path.extname(file.originalname).toLowerCase())),
 });
-const upload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB limit
 
-const DEFAULT_USER_ID = 'usr-demo-landlord-01';
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (n) => isoDay(new Date(today().getTime() + n * 86400000));
+const ownProperty = (userId, propertyId) => (propertyId ? db.prepare('SELECT * FROM properties WHERE id = ? AND user_id = ?').get(propertyId, userId) : null);
+const fail = (res, err) => {
+  console.error(err);
+  res.status(500).json({ success: false, error: 'Something went wrong. Please try again.' });
+};
 
 // ----------------------------------------------------
-// 1. RULES API
+// 1. PUBLIC: rules, free check, templates, regulation feed, session
 // ----------------------------------------------------
-router.get('/rules', (req, res) => {
+router.get('/rules', (_req, res) => {
   try {
-    const rules = db.prepare('SELECT * FROM rules ORDER BY effective_date ASC').all();
-    res.json({ success: true, rules });
+    res.json({ success: true, rules: db.prepare('SELECT * FROM rules ORDER BY effective_date ASC').all() });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 2. FREE COMPLIANCE CHECK API (No login required)
-// ----------------------------------------------------
+router.get('/me', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.json({ success: true, user: null });
+  const plan = effectivePlan(user);
+  res.json({
+    success: true,
+    user: { id: user.id, email: user.email, name: user.name },
+    plan,
+    properties_limit: PLAN_LIMITS[plan],
+    trial_ends_at: user.trial_ends_at,
+  });
+});
+
 router.post('/check', (req, res) => {
   try {
-    const answers = req.body;
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
+    if (!rateLimit(`check:${ip}`, 30, 3600)) return res.status(429).json({ success: false, error: 'Too many checks. Please try again later.' });
+    const answers = req.body || {};
     const rules = db.prepare('SELECT * FROM rules').all();
     const evaluation = evaluateCompliance(answers, rules);
-
-    const checkId = 'chk-' + uuidv4().slice(0, 8);
-    const insertCheck = db.prepare(`
+    const checkId = 'chk-' + uuidv4();
+    db.prepare(`
       INSERT INTO checks (id, email, postcode, property_type, tenancy_start_date, answers, score, red_count, amber_count, green_count, results)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    insertCheck.run(
-      checkId,
-      answers.email || null,
-      answers.postcode || null,
-      answers.property_type || 'Unknown',
-      answers.tenancy_start_date || null,
-      JSON.stringify(answers),
-      evaluation.score || 0,
-      evaluation.red_count || 0,
-      evaluation.amber_count || 0,
-      evaluation.green_count || 0,
-      JSON.stringify(evaluation)
-    );
-
-    res.json({
-      success: true,
-      check_id: checkId,
-      evaluation
-    });
+    `).run(checkId, answers.email || null, answers.postcode || null, answers.property_type || 'Unknown', answers.tenancy_start_date || null,
+      JSON.stringify(answers), evaluation.score || 0, evaluation.red_count || 0, evaluation.amber_count || 0, evaluation.green_count || 0, JSON.stringify(evaluation));
+    res.json({ success: true, check_id: checkId, evaluation });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.post('/check/email', (req, res) => {
   try {
-    const { check_id, email, name } = req.body;
-    if (!check_id || !email) {
-      return res.status(400).json({ success: false, error: 'Check ID and email are required.' });
-    }
-
-    db.prepare('UPDATE checks SET email = ? WHERE id = ?').run(email, check_id);
-
-    res.json({
-      success: true,
-      message: `Full compliance report has been registered for ${email}. Ready for PDF download.`
-    });
+    const { check_id, email } = req.body || {};
+    if (!check_id || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ success: false, error: 'Please enter a valid email address.' });
+    db.prepare('UPDATE checks SET email = ? WHERE id = ?').run(String(email).trim().slice(0, 254), check_id);
+    res.json({ success: true, message: 'Saved. You can download your full report now.' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.get('/check/:id', (req, res) => {
   try {
     const check = db.prepare('SELECT * FROM checks WHERE id = ?').get(req.params.id);
-    if (!check) {
-      return res.status(404).json({ success: false, error: 'Check result not found.' });
-    }
-    res.json({
-      success: true,
-      check: {
-        ...check,
-        answers: JSON.parse(check.answers),
-        results: JSON.parse(check.results)
-      }
-    });
+    if (!check) return res.status(404).json({ success: false, error: 'Check result not found.' });
+    res.json({ success: true, check: { ...check, answers: JSON.parse(check.answers), results: JSON.parse(check.results) } });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
+  }
+});
+
+router.get('/templates', (_req, res) => {
+  try {
+    res.json({ success: true, templates: db.prepare('SELECT * FROM templates ORDER BY name ASC').all() });
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+router.get('/regulation-updates', (_req, res) => {
+  try {
+    const updates = db.prepare('SELECT * FROM regulation_updates ORDER BY effective_date DESC').all();
+    res.json({ success: true, updates: updates.map((u) => ({ ...u, actions_required: u.actions_required ? JSON.parse(u.actions_required) : [] })) });
+  } catch (err) {
+    fail(res, err);
   }
 });
 
 // ----------------------------------------------------
-// 3. PROFILE & SUBSCRIPTIONS
+// Everything below needs a signed-in landlord and only touches their own data.
 // ----------------------------------------------------
+router.use(requireAuth);
+router.use((_req, _res, next) => {
+  refreshStatuses();
+  next();
+});
+
+// 2. PROFILE ------------------------------------------------
 router.get('/profile', (req, res) => {
-  try {
-    const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(DEFAULT_USER_ID);
-    const subscription = db.prepare('SELECT * FROM subscriptions WHERE user_id = ?').get(DEFAULT_USER_ID);
-    res.json({ success: true, profile, subscription });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  const u = req.user;
+  const plan = effectivePlan(u);
+  res.json({
+    success: true,
+    profile: { id: u.id, email: u.email, name: u.name, phone: u.phone, company_name: u.company_name, trial_ends_at: u.trial_ends_at },
+    subscription: {
+      plan_id: plan === 'trial' ? 'trial' : plan,
+      status: u.subscription_status,
+      billing_cycle: u.billing_cycle,
+      properties_limit: PLAN_LIMITS[plan],
+      has_billing: Boolean(u.billing_customer_id),
+    },
+  });
 });
 
 router.put('/profile', (req, res) => {
   try {
-    const { name, phone, company_name } = req.body;
-    db.prepare('UPDATE profiles SET name = ?, phone = ?, company_name = ? WHERE id = ?')
-      .run(name, phone, company_name, DEFAULT_USER_ID);
-    const updated = db.prepare('SELECT * FROM profiles WHERE id = ?').get(DEFAULT_USER_ID);
-    res.json({ success: true, profile: updated });
+    const { name, phone, company_name } = req.body || {};
+    db.prepare('UPDATE profiles SET name = ?, phone = ?, company_name = ? WHERE id = ?').run(name || null, phone || null, company_name || null, req.user.id);
+    res.json({ success: true, profile: db.prepare('SELECT id, email, name, phone, company_name FROM profiles WHERE id = ?').get(req.user.id) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-router.post('/subscriptions/upgrade', (req, res) => {
-  try {
-    const { plan_id, billing_cycle } = req.body; // 'starter', 'portfolio', 'pro'
-    const limits = { starter: 1, portfolio: 5, pro: 15 };
-    const monthlyPrices = { starter: 7.00, portfolio: 19.00, pro: 39.00 };
-    const annualPrices = { starter: 70.00, portfolio: 190.00, pro: 390.00 };
+// Invoices live in the Dodo customer portal ("Manage billing").
+router.get('/orders', (_req, res) => res.json({ success: true, orders: [] }));
 
-    const limit = limits[plan_id] || 1;
-    const price = billing_cycle === 'annual' ? annualPrices[plan_id] : monthlyPrices[plan_id];
+// 3. PROPERTIES ---------------------------------------------
+function scoreProperty(p, certificates) {
+  let score = 100;
+  const latest = (type) => certificates.filter((c) => c.type === type).sort((a, b) => (a.expiry_date < b.expiry_date ? 1 : -1))[0];
+  const gas = latest('gas_safety');
+  const eicr = latest('eicr');
+  const epc = latest('epc');
+  if (!gas || gas.status === 'expired') score -= 25;
+  else if (gas.status === 'expiring_soon') score -= 5;
+  if (!eicr || eicr.status === 'expired') score -= 20;
+  if (!epc || epc.status === 'expired' || ['F', 'G'].includes((epc.rating || '').toUpperCase())) score -= 25;
+  if (p.hmo && p.licensing_status !== 'compliant') score -= 20;
+  return Math.max(0, Math.min(100, score));
+}
 
-    // Update profile & subscription
-    db.prepare('UPDATE profiles SET subscription_tier = ?, billing_cycle = ? WHERE id = ?')
-      .run(plan_id, billing_cycle, DEFAULT_USER_ID);
+function enrichProperty(p) {
+  const tenancies = db.prepare('SELECT * FROM tenancies WHERE property_id = ?').all(p.id).map((t) => ({ ...t, tenants: JSON.parse(t.tenants), deposit: JSON.parse(t.deposit) }));
+  const certificates = db.prepare('SELECT * FROM certificates WHERE property_id = ?').all(p.id);
+  const tasks = db.prepare('SELECT * FROM tasks WHERE property_id = ?').all(p.id);
+  const score = scoreProperty(p, certificates);
+  if (score !== p.compliance_score) db.prepare('UPDATE properties SET compliance_score = ? WHERE id = ?').run(score, p.id);
+  return {
+    ...p,
+    compliance_score: score,
+    tenancies,
+    certificates,
+    tasks_count: tasks.length,
+    overdue_tasks_count: tasks.filter((t) => t.status === 'overdue').length,
+    due_soon_tasks_count: tasks.filter((t) => t.status === 'due_soon').length,
+  };
+}
 
-    db.prepare(`
-      UPDATE subscriptions 
-      SET plan_id = ?, properties_limit = ?, price_amount = ?, billing_cycle = ?, status = 'active'
-      WHERE user_id = ?
-    `).run(plan_id, limit, price, billing_cycle, DEFAULT_USER_ID);
-
-    // Create an order record
-    const invoiceNumber = `LR-INV-${Date.now().toString().slice(-6)}`;
-    db.prepare(`
-      INSERT INTO orders (id, user_id, subscription_id, amount, currency, status, invoice_number, invoice_url, description)
-      VALUES (?, ?, ?, ?, 'GBP', 'paid', ?, '#', ?)
-    `).run(
-      'ord-' + uuidv4().slice(0, 8),
-      DEFAULT_USER_ID,
-      'sub-demo-01',
-      price,
-      invoiceNumber,
-      `LandlordReady ${plan_id.toUpperCase()} Plan (${billing_cycle}) - ${limit} Properties`
-    );
-
-    res.json({
-      success: true,
-      message: `Successfully upgraded to ${plan_id.toUpperCase()} (${billing_cycle})!`,
-      plan_id,
-      billing_cycle,
-      limit
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-router.get('/orders', (req, res) => {
-  try {
-    const orders = db.prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC').all(DEFAULT_USER_ID);
-    res.json({ success: true, orders });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ----------------------------------------------------
-// 4. PROPERTIES & MULTI-PROPERTY DASHBOARD
-// ----------------------------------------------------
 router.get('/properties', (req, res) => {
   try {
-    const properties = db.prepare('SELECT * FROM properties WHERE user_id = ? ORDER BY created_at DESC').all(DEFAULT_USER_ID);
-    
-    // Enrich with tenancy, certs count, overdue tasks count
-    const enriched = properties.map(p => {
-      const tenancies = db.prepare('SELECT * FROM tenancies WHERE property_id = ?').all(p.id).map(t => ({
-        ...t,
-        tenants: JSON.parse(t.tenants),
-        deposit: JSON.parse(t.deposit)
-      }));
-      const certificates = db.prepare('SELECT * FROM certificates WHERE property_id = ?').all(p.id);
-      const tasks = db.prepare('SELECT * FROM tasks WHERE property_id = ?').all(p.id);
-
-      const overdueCount = tasks.filter(t => t.status === 'overdue').length;
-      const dueSoonCount = tasks.filter(t => t.status === 'due_soon').length;
-
-      // Calculate live compliance score based on certs & tenancy
-      let score = 100;
-      const gasCert = certificates.find(c => c.type === 'gas_safety');
-      const eicrCert = certificates.find(c => c.type === 'eicr');
-      const epcCert = certificates.find(c => c.type === 'epc');
-
-      if (!gasCert || gasCert.status === 'expired') score -= 25;
-      else if (gasCert.status === 'expiring_soon') score -= 5;
-
-      if (!eicrCert || eicrCert.status === 'expired') score -= 20;
-      if (!epcCert || epcCert.status === 'expired' || ['F', 'G'].includes((epcCert.rating || '').toUpperCase())) score -= 25;
-      if (p.hmo && p.licensing_status !== 'compliant') score -= 20;
-
-      score = Math.max(0, Math.min(100, score));
-
-      // Update property compliance score in DB if changed
-      db.prepare('UPDATE properties SET compliance_score = ? WHERE id = ?').run(score, p.id);
-
-      return {
-        ...p,
-        compliance_score: score,
-        tenancies,
-        certificates,
-        tasks_count: tasks.length,
-        overdue_tasks_count: overdueCount,
-        due_soon_tasks_count: dueSoonCount
-      };
-    });
-
-    res.json({ success: true, properties: enriched });
+    const properties = db.prepare('SELECT * FROM properties WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id);
+    res.json({ success: true, properties: properties.map(enrichProperty) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-router.post('/properties', (req, res) => {
+const insertTask = () =>
+  db.prepare(`INSERT INTO tasks (id, property_id, tenancy_id, type, title, description, due_date, status, priority, source_rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+function addTask({ property_id, tenancy_id = null, type, title, description, due_date, priority, rule = null }) {
+  insertTask().run('tsk-' + uuidv4(), property_id, tenancy_id, type, title, description, due_date, taskStatus({ due_date }), priority, rule);
+}
+
+router.post('/properties', requirePlan, (req, res) => {
   try {
-    const {
-      address_line1,
-      address_line2,
-      city,
-      postcode,
-      local_authority,
-      property_type,
-      bedrooms,
-      hmo,
-      hmo_licence_number,
-      licensing_type,
-      licensing_status
-    } = req.body;
+    const b = req.body || {};
+    if (!b.address_line1 || !b.city || !b.postcode) return res.status(400).json({ success: false, error: 'Address line 1, city, and postcode are required.' });
 
-    if (!address_line1 || !city || !postcode) {
-      return res.status(400).json({ success: false, error: 'Address line 1, city, and postcode are required.' });
+    const limit = PLAN_LIMITS[effectivePlan(req.user)];
+    const count = db.prepare('SELECT COUNT(*) as count FROM properties WHERE user_id = ?').get(req.user.id).count;
+    if (count >= limit) {
+      return res.status(403).json({ success: false, limit_reached: true, error: `Your plan covers ${limit} propert${limit === 1 ? 'y' : 'ies'}. Upgrade to add more.` });
     }
 
-    // Check plan limits
-    const sub = db.prepare('SELECT properties_limit FROM subscriptions WHERE user_id = ?').get(DEFAULT_USER_ID);
-    const count = db.prepare('SELECT COUNT(*) as count FROM properties WHERE user_id = ?').get(DEFAULT_USER_ID).count;
-    if (sub && count >= sub.properties_limit) {
-      return res.status(403).json({
-        success: false,
-        limit_reached: true,
-        error: `Property limit reached (${sub.properties_limit} property max on your current plan). Please upgrade to add more properties.`
-      });
-    }
-
-    const propId = 'prop-' + uuidv4().slice(0, 8);
+    const propId = 'prop-' + uuidv4();
     db.prepare(`
       INSERT INTO properties (id, user_id, address_line1, address_line2, city, postcode, local_authority, property_type, bedrooms, hmo, hmo_licence_number, licensing_type, licensing_status, compliance_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 75)
-    `).run(
-      propId,
-      DEFAULT_USER_ID,
-      address_line1,
-      address_line2 || null,
-      city,
-      postcode.toUpperCase(),
-      local_authority || 'Local Council',
-      property_type || 'Terraced',
-      parseInt(bedrooms) || 2,
-      hmo ? 1 : 0,
-      hmo_licence_number || null,
-      licensing_type || 'none',
-      licensing_status || 'not_required'
-    );
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(propId, req.user.id, b.address_line1, b.address_line2 || null, b.city, String(b.postcode).toUpperCase(), b.local_authority || null,
+      b.property_type || null, parseInt(b.bedrooms) || null, b.hmo ? 1 : 0, b.hmo_licence_number || null, b.licensing_type || 'none', b.licensing_status || 'not_required');
 
-    // Auto-create initial statutory tasks for the newly added property
-    const insertTask = db.prepare(`
-      INSERT INTO tasks (id, property_id, type, title, description, due_date, status, priority, source_rule_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    // Starter tasks: record the certificates the law requires. Real renewal dates are set when a certificate is added.
+    addTask({ property_id: propId, type: 'certificate_upload', title: 'Add your current Gas Safety Certificate (CP12)', description: 'Needed every 12 months where there is a gas appliance. Add it so we can track the renewal date.', due_date: addDays(14), priority: 'high', rule: 'rule-gas-safety' });
+    addTask({ property_id: propId, type: 'certificate_upload', title: 'Add your current Electrical (EICR) report', description: 'Needed at least every 5 years. Add it so we can track the renewal date.', due_date: addDays(14), priority: 'high', rule: 'rule-eicr' });
+    addTask({ property_id: propId, type: 'certificate_upload', title: 'Add your Energy Performance Certificate (EPC)', description: 'Valid for 10 years; the property must meet the minimum rating to be let.', due_date: addDays(14), priority: 'medium', rule: 'rule-epc' });
+    addTask({ property_id: propId, type: 'alarm_test', title: 'Check smoke and carbon monoxide alarms', description: 'Smoke alarm on every storey with living space; CO alarm in rooms with a fixed combustion appliance. Test at the start of each tenancy.', due_date: addDays(14), priority: 'high', rule: 'rule-smoke-co-alarms' });
 
-    // 1. Gas Safety Task
-    insertTask.run(
-      'tsk-' + uuidv4().slice(0, 8),
-      propId,
-      'certificate_renewal',
-      'Obtain / Upload Annual Gas Safety CP12 Certificate',
-      'Every gas appliance must have a valid CP12 check carried out by a Gas Safe registered engineer annually.',
-      '2026-12-15',
-      'pending',
-      'urgent',
-      'rule-gas-safety'
-    );
-
-    // 2. Smoke/CO Alarms Task
-    insertTask.run(
-      'tsk-' + uuidv4().slice(0, 8),
-      propId,
-      'alarm_test',
-      'Verify Working Smoke & Carbon Monoxide Alarms',
-      'Ensure smoke alarms on every habitable level and CO alarms in rooms with combustion appliances are tested.',
-      '2026-12-01',
-      'pending',
-      'high',
-      'rule-smoke-co-alarms'
-    );
-
-    // 3. PRS Database Task
-    insertTask.run(
-      'tsk-' + uuidv4().slice(0, 8),
-      propId,
-      'prs_database',
-      'PRS National Database Onboarding Preparation',
-      'Digitise compliance certs and prepare landlord registration for Phase 2 regional rollout.',
-      '2026-10-01',
-      'pending',
-      'medium',
-      'rule-prs-database'
-    );
-
-    const created = db.prepare('SELECT * FROM properties WHERE id = ?').get(propId);
-    res.json({ success: true, property: created });
+    res.json({ success: true, property: enrichProperty(db.prepare('SELECT * FROM properties WHERE id = ?').get(propId)) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.put('/properties/:id', (req, res) => {
   try {
-    const {
-      address_line1,
-      address_line2,
-      city,
-      postcode,
-      local_authority,
-      property_type,
-      bedrooms,
-      hmo,
-      hmo_licence_number,
-      licensing_type,
-      licensing_status,
-      prs_database_status
-    } = req.body;
-
+    if (!ownProperty(req.user.id, req.params.id)) return res.status(404).json({ success: false, error: 'Property not found.' });
+    const b = req.body || {};
     db.prepare(`
       UPDATE properties SET
-        address_line1 = COALESCE(?, address_line1),
-        address_line2 = COALESCE(?, address_line2),
-        city = COALESCE(?, city),
-        postcode = COALESCE(?, postcode),
-        local_authority = COALESCE(?, local_authority),
-        property_type = COALESCE(?, property_type),
-        bedrooms = COALESCE(?, bedrooms),
-        hmo = COALESCE(?, hmo),
-        hmo_licence_number = COALESCE(?, hmo_licence_number),
-        licensing_type = COALESCE(?, licensing_type),
-        licensing_status = COALESCE(?, licensing_status),
-        prs_database_status = COALESCE(?, prs_database_status)
+        address_line1 = COALESCE(?, address_line1), address_line2 = COALESCE(?, address_line2), city = COALESCE(?, city),
+        postcode = COALESCE(?, postcode), local_authority = COALESCE(?, local_authority), property_type = COALESCE(?, property_type),
+        bedrooms = COALESCE(?, bedrooms), hmo = COALESCE(?, hmo), hmo_licence_number = COALESCE(?, hmo_licence_number),
+        licensing_type = COALESCE(?, licensing_type), licensing_status = COALESCE(?, licensing_status), prs_database_status = COALESCE(?, prs_database_status)
       WHERE id = ? AND user_id = ?
-    `).run(
-      address_line1, address_line2, city, postcode, local_authority,
-      property_type, bedrooms, hmo ? 1 : 0, hmo_licence_number,
-      licensing_type, licensing_status, prs_database_status,
-      req.params.id, DEFAULT_USER_ID
-    );
-
-    const updated = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.params.id);
-    res.json({ success: true, property: updated });
+    `).run(b.address_line1 ?? null, b.address_line2 ?? null, b.city ?? null, b.postcode ?? null, b.local_authority ?? null, b.property_type ?? null,
+      b.bedrooms ?? null, b.hmo === undefined ? null : b.hmo ? 1 : 0, b.hmo_licence_number ?? null, b.licensing_type ?? null, b.licensing_status ?? null,
+      b.prs_database_status ?? null, req.params.id, req.user.id);
+    res.json({ success: true, property: db.prepare('SELECT * FROM properties WHERE id = ?').get(req.params.id) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.delete('/properties/:id', (req, res) => {
   try {
-    db.prepare('DELETE FROM tasks WHERE property_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM certificates WHERE property_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM tenancies WHERE property_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM documents WHERE property_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM properties WHERE id = ? AND user_id = ?').run(req.params.id, DEFAULT_USER_ID);
-
-    res.json({ success: true, message: 'Property and associated records deleted.' });
+    if (!ownProperty(req.user.id, req.params.id)) return res.status(404).json({ success: false, error: 'Property not found.' });
+    const files = db.prepare('SELECT stored_file FROM certificates WHERE property_id = ? AND stored_file IS NOT NULL').all(req.params.id);
+    db.transaction(() => {
+      db.prepare('DELETE FROM tasks WHERE property_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM certificates WHERE property_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM tenancies WHERE property_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM documents WHERE property_id = ?').run(req.params.id);
+      db.prepare('UPDATE qa_logs SET property_id = NULL WHERE property_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM properties WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+    })();
+    for (const f of files) fs.promises.unlink(path.join(uploadsDir, path.basename(f.stored_file))).catch(() => {});
+    res.json({ success: true, message: 'Property and its records deleted.' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// Full Compliance Pack Data Export (for lenders, insurers, tribunal, or buyers)
 router.get('/properties/:id/pack', (req, res) => {
   try {
-    const property = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.params.id);
+    const property = ownProperty(req.user.id, req.params.id);
     if (!property) return res.status(404).json({ success: false, error: 'Property not found.' });
-
-    const tenancies = db.prepare('SELECT * FROM tenancies WHERE property_id = ?').all(property.id).map(t => ({
-      ...t,
-      tenants: JSON.parse(t.tenants),
-      deposit: JSON.parse(t.deposit)
-    }));
-
-    const certificates = db.prepare('SELECT * FROM certificates WHERE property_id = ? ORDER BY expiry_date DESC').all(property.id);
-    const tasks = db.prepare('SELECT * FROM tasks WHERE property_id = ? ORDER BY due_date ASC').all(property.id);
-    const documents = db.prepare('SELECT * FROM documents WHERE property_id = ? ORDER BY created_at DESC').all(property.id);
-    const qa_logs = db.prepare('SELECT * FROM qa_logs WHERE property_id = ? ORDER BY created_at DESC').all(property.id);
-    const rules = db.prepare('SELECT * FROM rules').all();
-
     res.json({
       success: true,
       pack: {
         generated_at: new Date().toISOString(),
         property,
-        tenancies,
-        certificates,
-        tasks,
-        documents,
-        qa_logs,
-        verified_rules_count: rules.length,
-        authority_jurisdiction: 'England (Renters Rights Act 2025/2026 Compliant)'
-      }
+        tenancies: db.prepare('SELECT * FROM tenancies WHERE property_id = ?').all(property.id).map((t) => ({ ...t, tenants: JSON.parse(t.tenants), deposit: JSON.parse(t.deposit) })),
+        certificates: db.prepare('SELECT * FROM certificates WHERE property_id = ? ORDER BY expiry_date DESC').all(property.id),
+        tasks: db.prepare('SELECT * FROM tasks WHERE property_id = ? ORDER BY due_date ASC').all(property.id),
+        documents: db.prepare('SELECT * FROM documents WHERE property_id = ? ORDER BY created_at DESC').all(property.id),
+        qa_logs: db.prepare('SELECT * FROM qa_logs WHERE property_id = ? AND user_id = ? ORDER BY created_at DESC').all(property.id, req.user.id),
+        verified_rules_count: db.prepare('SELECT COUNT(*) as c FROM rules').get().c,
+        authority_jurisdiction: 'England',
+      },
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 5. TENANCIES API
-// ----------------------------------------------------
-router.post('/tenancies', (req, res) => {
+// 4. TENANCIES ----------------------------------------------
+router.post('/tenancies', requirePlan, (req, res) => {
   try {
-    const {
-      property_id,
-      tenants, // array of { name, email, phone }
-      start_date,
-      rent_amount,
-      rent_frequency,
-      deposit_amount,
-      deposit_scheme,
-      deposit_ref,
-      prescribed_info_given
-    } = req.body;
+    const b = req.body || {};
+    if (!b.property_id || !b.start_date || !b.rent_amount) return res.status(400).json({ success: false, error: 'Property, start date, and rent amount are required.' });
+    if (!ownProperty(req.user.id, b.property_id)) return res.status(404).json({ success: false, error: 'Property not found.' });
+    const tenants = Array.isArray(b.tenants) ? b.tenants.filter((t) => t && t.name) : [];
+    if (tenants.length === 0) return res.status(400).json({ success: false, error: 'Add at least one tenant name.' });
 
-    if (!property_id || !start_date || !rent_amount) {
-      return res.status(400).json({ success: false, error: 'Property ID, start date, and rent amount are required.' });
-    }
-
-    const tenancyId = 'ten-' + uuidv4().slice(0, 8);
-    const depositObj = {
-      amount: parseFloat(deposit_amount) || 0,
-      scheme: deposit_scheme || 'Deposit Protection Service (DPS)',
-      deposit_ref: deposit_ref || 'PENDING-REG',
-      protected_date: new Date().toISOString().split('T')[0],
-      prescribed_info_given: Boolean(prescribed_info_given)
+    const tenancyId = 'ten-' + uuidv4();
+    const deposit = {
+      amount: parseFloat(b.deposit_amount) || 0,
+      scheme: b.deposit_scheme || null,
+      deposit_ref: b.deposit_ref || null,
+      protected_date: b.deposit_protected_date || null,
+      prescribed_info_given: Boolean(b.prescribed_info_given),
     };
-
     db.prepare(`
       INSERT INTO tenancies (id, property_id, tenants, start_date, tenancy_type, rent_amount, rent_frequency, rent_last_increased_date, deposit, information_sheet_given, status)
-      VALUES (?, ?, ?, ?, 'periodic', ?, ?, ?, ?, 1, 'active')
-    `).run(
-      tenancyId,
-      property_id,
-      JSON.stringify(tenants || [{ name: 'Primary Tenant', email: 'tenant@example.com' }]),
-      start_date,
-      parseFloat(rent_amount),
-      rent_frequency || 'monthly',
-      start_date,
-      JSON.stringify(depositObj)
-    );
+      VALUES (?, ?, ?, ?, 'periodic', ?, ?, ?, ?, ?, 'active')
+    `).run(tenancyId, b.property_id, JSON.stringify(tenants), b.start_date, parseFloat(b.rent_amount), b.rent_frequency || 'monthly',
+      b.rent_last_increased_date || null, JSON.stringify(deposit), b.information_sheet_given ? 1 : 0);
 
-    // Auto-create Deposit Prescribed Information task (30 day deadline)
-    const startDateObj = new Date(start_date);
-    const piDeadline = new Date(startDateObj);
-    piDeadline.setDate(piDeadline.getDate() + 30);
-
-    db.prepare(`
-      INSERT INTO tasks (id, property_id, tenancy_id, type, title, description, due_date, status, priority, source_rule_id)
-      VALUES (?, ?, ?, 'deposit_prescribed_info', 'Serve Deposit Prescribed Information & Scheme Terms', 'Strict 30-day statutory clock: deliver countersigned prescribed info to avoid 1x-3x penalties.', ?, 'pending', 'urgent', 'rule-deposit-protection')
-    `).run('tsk-' + uuidv4().slice(0, 8), property_id, tenancyId, piDeadline.toISOString().split('T')[0]);
-
-    // Auto-create Rent Review Eligibility task (12 months after start)
-    const rentReviewDate = new Date(startDateObj);
-    rentReviewDate.setFullYear(rentReviewDate.getFullYear() + 1);
-    db.prepare(`
-      INSERT INTO tasks (id, property_id, tenancy_id, type, title, description, due_date, status, priority, source_rule_id)
-      VALUES (?, ?, ?, 'rent_review', 'Annual Rent Review Window Opens (Section 13 Form 4)', 'Eligible to propose statutory rent increase with 2 months notice.', ?, 'pending', 'medium', 'rule-rent-increase-process')
-    `).run('tsk-' + uuidv4().slice(0, 8), property_id, tenancyId, rentReviewDate.toISOString().split('T')[0]);
+    const start = new Date(b.start_date);
+    if (deposit.amount > 0 && !deposit.prescribed_info_given) {
+      const due = new Date(start.getTime() + 30 * 86400000);
+      addTask({ property_id: b.property_id, tenancy_id: tenancyId, type: 'deposit_prescribed_info', title: 'Protect the deposit and serve the prescribed information', description: 'The deposit must be protected in a government-approved scheme and the prescribed information given to the tenant within 30 days of receiving it.', due_date: isoDay(due), priority: 'urgent', rule: 'rule-deposit-protection' });
+    }
+    if (!b.information_sheet_given) {
+      addTask({ property_id: b.property_id, tenancy_id: tenancyId, type: 'information_sheet', title: 'Give the tenant the required information sheet', description: 'Check the current government requirement for the tenancy information sheet and record when you gave it.', due_date: addDays(7), priority: 'high', rule: null });
+    }
+    const review = new Date(start);
+    review.setFullYear(review.getFullYear() + 1);
+    addTask({ property_id: b.property_id, tenancy_id: tenancyId, type: 'rent_review', title: 'Earliest date for a rent review', description: 'Rent can be increased at most once a year, using the statutory notice procedure with at least two months’ notice.', due_date: isoDay(review), priority: 'medium', rule: 'rule-rent-increase-process' });
 
     const created = db.prepare('SELECT * FROM tenancies WHERE id = ?').get(tenancyId);
-    res.json({
-      success: true,
-      tenancy: {
-        ...created,
-        tenants: JSON.parse(created.tenants),
-        deposit: JSON.parse(created.deposit)
-      }
-    });
+    res.json({ success: true, tenancy: { ...created, tenants: JSON.parse(created.tenants), deposit: JSON.parse(created.deposit) } });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 6. CERTIFICATES & DOCUMENT VAULT UPLOADS
-// ----------------------------------------------------
+// 5. CERTIFICATES & FILES ----------------------------------
 router.get('/certificates', (req, res) => {
   try {
     const { property_id } = req.query;
-    let query = 'SELECT * FROM certificates';
-    const params = [];
-    if (property_id) {
-      query += ' WHERE property_id = ?';
-      params.push(property_id);
-    }
-    query += ' ORDER BY expiry_date ASC';
-    const certs = db.prepare(query).all(...params);
-    res.json({ success: true, certificates: certs });
+    const rows = property_id
+      ? db.prepare('SELECT c.* FROM certificates c JOIN properties p ON c.property_id = p.id WHERE p.user_id = ? AND c.property_id = ? ORDER BY c.expiry_date ASC').all(req.user.id, property_id)
+      : db.prepare('SELECT c.* FROM certificates c JOIN properties p ON c.property_id = p.id WHERE p.user_id = ? ORDER BY c.expiry_date ASC').all(req.user.id);
+    res.json({ success: true, certificates: rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-router.post('/certificates/upload', upload.single('file'), (req, res) => {
+router.post('/certificates/upload', requirePlan, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: 'Upload a PDF or image (max 15 MB).' });
+  res.json({ success: true, file_path: `/api/files/${req.file.filename}`, file_name: req.file.originalname, file_size: req.file.size, mime_type: req.file.mimetype });
+});
+
+router.get('/files/:name', (req, res) => {
+  const name = path.basename(req.params.name);
+  if (!name.startsWith(`${req.user.id}__`)) return res.status(404).json({ success: false, error: 'File not found.' });
+  const full = path.join(uploadsDir, name);
+  if (!fs.existsSync(full)) return res.status(404).json({ success: false, error: 'File not found.' });
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.sendFile(full);
+});
+
+router.post('/certificates', requirePlan, (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'No file uploaded.' });
+    const b = req.body || {};
+    if (!b.property_id || !b.type || !b.issue_date || !b.expiry_date) return res.status(400).json({ success: false, error: 'Property, certificate type, issue date, and expiry date are required.' });
+    if (!ownProperty(req.user.id, b.property_id)) return res.status(404).json({ success: false, error: 'Property not found.' });
+    let storedFile = null;
+    if (b.file_path) {
+      const name = path.basename(String(b.file_path));
+      if (!name.startsWith(`${req.user.id}__`)) return res.status(400).json({ success: false, error: 'Invalid file.' });
+      storedFile = name;
     }
-    const fileUrl = `/uploads/${req.file.filename}`;
-    res.json({
-      success: true,
-      file_path: fileUrl,
-      file_name: req.file.originalname,
-      file_size: req.file.size,
-      mime_type: req.file.mimetype
-    });
+    const certId = 'cert-' + uuidv4();
+    const status = certificateStatus(b.expiry_date);
+    db.prepare(`
+      INSERT INTO certificates (id, property_id, type, certificate_number, issue_date, expiry_date, status, rating, engineer_or_assessor, file_path, file_name, notes, stored_file)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(certId, b.property_id, b.type, b.certificate_number || null, b.issue_date, b.expiry_date, status, b.rating || null, b.engineer_or_assessor || null,
+      storedFile ? `/api/files/${storedFile}` : null, b.file_name || null, b.notes || null, storedFile);
+
+    // The "add your certificate" starter task is done once one is added.
+    db.prepare("UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE property_id = ? AND type = 'certificate_upload' AND source_rule_id = ? AND status != 'completed'")
+      .run(b.property_id, { gas_safety: 'rule-gas-safety', eicr: 'rule-eicr', epc: 'rule-epc' }[b.type] || '');
+
+    const titles = { gas_safety: 'Renew Gas Safety Certificate (CP12)', eicr: 'Renew Electrical Installation Condition Report (EICR)', epc: 'Renew Energy Performance Certificate (EPC)', smoke_co: 'Smoke and CO alarm check', hmo_licence: 'Renew HMO licence' };
+    addTask({ property_id: b.property_id, type: 'certificate_renewal', title: titles[b.type] || 'Renew certificate', description: `Certificate ${b.certificate_number || ''} expires on ${b.expiry_date}. Book the inspection before then.`.replace('  ', ' '), due_date: b.expiry_date, priority: 'high', rule: { gas_safety: 'rule-gas-safety', eicr: 'rule-eicr', epc: 'rule-epc' }[b.type] || null });
+
+    res.json({ success: true, certificate: db.prepare('SELECT * FROM certificates WHERE id = ?').get(certId) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-router.post('/certificates', (req, res) => {
-  try {
-    const {
-      property_id,
-      type, // 'gas_safety', 'eicr', 'epc', 'smoke_co', 'hmo_licence'
-      certificate_number,
-      issue_date,
-      expiry_date,
-      rating,
-      engineer_or_assessor,
-      file_path,
-      file_name,
-      notes
-    } = req.body;
-
-    if (!property_id || !type || !issue_date || !expiry_date) {
-      return res.status(400).json({ success: false, error: 'Property ID, certificate type, issue date, and expiry date are required.' });
-    }
-
-    const certId = 'cert-' + uuidv4().slice(0, 8);
-    const expDate = new Date(expiry_date);
-    const today = new Date('2026-11-18');
-    const diffDays = Math.ceil((expDate - today) / (1000 * 60 * 60 * 24));
-
-    let status = 'valid';
-    if (diffDays < 0) status = 'expired';
-    else if (diffDays <= 30) status = 'expiring_soon';
-
-    db.prepare(`
-      INSERT INTO certificates (id, property_id, type, certificate_number, issue_date, expiry_date, status, rating, engineer_or_assessor, file_path, file_name, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      certId,
-      property_id,
-      type,
-      certificate_number || null,
-      issue_date,
-      expiry_date,
-      status,
-      rating || null,
-      engineer_or_assessor || null,
-      file_path || null,
-      file_name || null,
-      notes || null
-    );
-
-    // Auto-create renewal task on calendar
-    const taskTitles = {
-      gas_safety: 'Renew Annual Gas Safety Certificate (CP12)',
-      eicr: 'Renew 5-Year Electrical Installation Condition Report (EICR)',
-      epc: 'Renew Energy Performance Certificate (EPC)',
-      smoke_co: 'Annual Smoke & Carbon Monoxide Alarm Test',
-      hmo_licence: 'Renew Council HMO Licence'
-    };
-
-    db.prepare(`
-      INSERT INTO tasks (id, property_id, type, title, description, due_date, status, priority, source_rule_id)
-      VALUES (?, ?, 'certificate_renewal', ?, ?, ?, ?, 'high', ?)
-    `).run(
-      'tsk-' + uuidv4().slice(0, 8),
-      property_id,
-      taskTitles[type] || 'Renew Safety Certificate',
-      `Certificate ${certificate_number || ''} expires on ${expiry_date}. Ensure inspection is completed before expiration.`,
-      expiry_date,
-      status === 'expired' ? 'overdue' : (status === 'expiring_soon' ? 'due_soon' : 'pending'),
-      type === 'gas_safety' ? 'rule-gas-safety' : (type === 'eicr' ? 'rule-eicr' : 'rule-epc')
-    );
-
-    const created = db.prepare('SELECT * FROM certificates WHERE id = ?').get(certId);
-    res.json({ success: true, certificate: created });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ----------------------------------------------------
-// 7. COMPLIANCE CALENDAR & TASKS
-// ----------------------------------------------------
+// 6. TASKS ---------------------------------------------------
 router.get('/tasks', (req, res) => {
   try {
     const { property_id, status } = req.query;
-    let query = `
-      SELECT t.*, p.address_line1, p.city, p.postcode 
-      FROM tasks t
-      JOIN properties p ON t.property_id = p.id
-      WHERE p.user_id = ?
-    `;
-    const params = [DEFAULT_USER_ID];
-
+    let q = `SELECT t.*, p.address_line1, p.city, p.postcode FROM tasks t JOIN properties p ON t.property_id = p.id WHERE p.user_id = ?`;
+    const params = [req.user.id];
     if (property_id) {
-      query += ' AND t.property_id = ?';
+      q += ' AND t.property_id = ?';
       params.push(property_id);
     }
     if (status) {
-      query += ' AND t.status = ?';
+      q += ' AND t.status = ?';
       params.push(status);
     }
-
-    query += ' ORDER BY t.due_date ASC';
-    const tasks = db.prepare(query).all(...params);
-    res.json({ success: true, tasks });
+    res.json({ success: true, tasks: db.prepare(q + ' ORDER BY t.due_date ASC').all(...params) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-router.post('/tasks', (req, res) => {
+router.post('/tasks', requirePlan, (req, res) => {
   try {
-    const { property_id, type, title, description, due_date, priority } = req.body;
-    const taskId = 'tsk-' + uuidv4().slice(0, 8);
-
-    db.prepare(`
-      INSERT INTO tasks (id, property_id, type, title, description, due_date, status, priority)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(taskId, property_id, type || 'general', title, description || '', due_date, priority || 'medium');
-
-    const created = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
-    res.json({ success: true, task: created });
+    const b = req.body || {};
+    if (!b.title || !b.due_date) return res.status(400).json({ success: false, error: 'Title and due date are required.' });
+    if (!ownProperty(req.user.id, b.property_id)) return res.status(404).json({ success: false, error: 'Property not found.' });
+    const id = 'tsk-' + uuidv4();
+    insertTask().run(id, b.property_id, null, b.type || 'general', b.title, b.description || '', b.due_date, taskStatus({ due_date: b.due_date }), b.priority || 'medium', null);
+    res.json({ success: true, task: db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.patch('/tasks/:id', (req, res) => {
   try {
-    const { status, completed_at, due_date } = req.body;
-    db.prepare(`
-      UPDATE tasks 
-      SET status = COALESCE(?, status),
-          completed_at = COALESCE(?, completed_at),
-          due_date = COALESCE(?, due_date)
-      WHERE id = ?
-    `).run(status, completed_at, due_date, req.params.id);
-
-    const updated = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
-    res.json({ success: true, task: updated });
+    const task = db.prepare('SELECT t.* FROM tasks t JOIN properties p ON t.property_id = p.id WHERE t.id = ? AND p.user_id = ?').get(req.params.id, req.user.id);
+    if (!task) return res.status(404).json({ success: false, error: 'Task not found.' });
+    const { status, due_date } = req.body || {};
+    const nextDue = due_date || task.due_date;
+    const nextStatus = status === 'completed' ? 'completed' : taskStatus({ status: 'pending', due_date: nextDue });
+    const completedAt = nextStatus === 'completed' ? task.completed_at || new Date().toISOString() : null;
+    // A new due date re-arms the reminders.
+    const reset = due_date && due_date !== task.due_date ? ', reminder_60d_sent = 0, reminder_30d_sent = 0, reminder_7d_sent = 0' : '';
+    db.prepare(`UPDATE tasks SET status = ?, due_date = ?, completed_at = ?${reset} WHERE id = ?`).run(nextStatus, nextDue, completedAt, task.id);
+    res.json({ success: true, task: db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// Email Reminders Simulation (60/30/7 days before due date)
+/** Preview of upcoming reminder emails (they are sent automatically every day). */
 router.post('/tasks/simulate-reminders', (req, res) => {
   try {
-    const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(DEFAULT_USER_ID);
-    const tasks = db.prepare(`
-      SELECT t.*, p.address_line1, p.city, p.postcode
-      FROM tasks t
-      JOIN properties p ON t.property_id = p.id
-      WHERE t.status != 'completed'
-    `).all();
-
-    const simulatedDispatches = [];
-    const today = new Date('2026-11-18');
-
-    for (const t of tasks) {
-      const dueDate = new Date(t.due_date);
-      const diffDays = Math.ceil((dueDate - today) / (1000 * 60 * 60 * 24));
-
-      // 60-day reminder
-      if (diffDays <= 60 && diffDays > 30 && !t.reminder_60d_sent) {
-        db.prepare('UPDATE tasks SET reminder_60d_sent = 1 WHERE id = ?').run(t.id);
-        simulatedDispatches.push({
-          taskId: t.id,
-          to: profile.email,
-          subject: `[60-Day Reminder] Compliance action due for ${t.address_line1}`,
-          stage: '60-day early notice',
-          dueDate: t.due_date,
-          diffDays,
-          title: t.title,
-          bodyText: `Dear ${profile.name},\n\nThis is your early statutory compliance reminder for ${t.address_line1}, ${t.postcode}.\n\nObligation: ${t.title}\nDue Date: ${t.due_date} (${diffDays} days remaining).\n\nEarly preparation ensures you maintain possession rights under the Renters' Rights Act.`
-        });
-      }
-      // 30-day reminder
-      else if (diffDays <= 30 && diffDays > 7 && !t.reminder_30d_sent) {
-        db.prepare('UPDATE tasks SET reminder_30d_sent = 1 WHERE id = ?').run(t.id);
-        simulatedDispatches.push({
-          taskId: t.id,
-          to: profile.email,
-          subject: `[30-Day Alert] Action required soon: ${t.title}`,
-          stage: '30-day urgent notice',
-          dueDate: t.due_date,
-          diffDays,
-          title: t.title,
-          bodyText: `Dear ${profile.name},\n\nAction Required: ${t.title} for ${t.address_line1} is due in ${diffDays} days on ${t.due_date}.\n\nPlease book certified contractors or serve paperwork before the statutory deadline.`
-        });
-      }
-      // 7-day urgent reminder or overdue
-      else if (diffDays <= 7 && !t.reminder_7d_sent) {
-        db.prepare('UPDATE tasks SET reminder_7d_sent = 1 WHERE id = ?').run(t.id);
-        simulatedDispatches.push({
-          taskId: t.id,
-          to: profile.email,
-          subject: `[URGENT 7-Day / Overdue Alert] ${t.title} for ${t.address_line1}`,
-          stage: diffDays < 0 ? 'Overdue Breach Alert' : '7-day final warning',
-          dueDate: t.due_date,
-          diffDays,
-          title: t.title,
-          bodyText: `URGENT COMPLIANCE NOTICE:\n${t.title} is ${diffDays < 0 ? `OVERDUE by ${Math.abs(diffDays)} days!` : `due in ${diffDays} days!`}\n\nFailure to comply carries fines up to £30,000 and invalidates Section 8 possession.`
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      reminders_sent_count: simulatedDispatches.length,
-      dispatches: simulatedDispatches
-    });
+    const tasks = db.prepare(`SELECT t.*, p.address_line1, p.postcode FROM tasks t JOIN properties p ON t.property_id = p.id WHERE p.user_id = ? AND t.status != 'completed' ORDER BY t.due_date ASC`).all(req.user.id);
+    const dispatches = tasks
+      .map((t) => ({ t, d: daysUntil(t.due_date) }))
+      .filter(({ d }) => d <= 60)
+      .map(({ t, d }) => ({
+        taskId: t.id,
+        to: req.user.email,
+        subject: d < 0 ? `Overdue: ${t.title} – ${t.address_line1}` : `Due in ${d} days: ${t.title} – ${t.address_line1}`,
+        stage: d < 0 ? 'Overdue' : d <= 7 ? '7-day reminder' : d <= 30 ? '30-day reminder' : '60-day reminder',
+        dueDate: t.due_date,
+        diffDays: d,
+        title: t.title,
+        bodyText: `${t.title} for ${t.address_line1}, ${t.postcode} is ${d < 0 ? `overdue by ${-d} days` : `due in ${d} days`} (${t.due_date}).`,
+      }));
+    res.json({ success: true, preview: true, reminders_sent_count: 0, dispatches, message: 'Reminders are emailed automatically at 60, 30 and 7 days. This is a preview.' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 8. DOCUMENT GENERATOR & TEMPLATES
-// ----------------------------------------------------
-router.get('/templates', (req, res) => {
+// 7. DOCUMENTS ------------------------------------------------
+router.post('/documents/generate', requirePlan, (req, res) => {
   try {
-    const templates = db.prepare('SELECT * FROM templates ORDER BY name ASC').all();
-    res.json({ success: true, templates });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-router.post('/documents/generate', (req, res) => {
-  try {
-    const { template_slug, property_id, custom_values } = req.body;
+    const { template_slug, property_id, custom_values = {} } = req.body || {};
     const template = db.prepare('SELECT * FROM templates WHERE slug = ?').get(template_slug);
-    if (!template) {
-      return res.status(404).json({ success: false, error: 'Document template not found.' });
-    }
+    if (!template) return res.status(404).json({ success: false, error: 'Document template not found.' });
+    const property = ownProperty(req.user.id, property_id);
+    if (!property) return res.status(404).json({ success: false, error: 'Choose one of your properties.' });
+    const tenancy = db.prepare("SELECT * FROM tenancies WHERE property_id = ? AND status = 'active' ORDER BY start_date DESC").get(property.id);
 
-    const property = db.prepare('SELECT * FROM properties WHERE id = ?').get(property_id);
-    const tenancy = db.prepare("SELECT * FROM tenancies WHERE property_id = ? AND status = 'active'").get(property_id);
-
-    let tenantsList = 'Tenant Name';
-    let rentAmount = '1,500.00';
-    let depositAmount = '1,730.00';
-    let schemeName = 'Deposit Protection Service (DPS)';
-
-    if (tenancy) {
-      const parsedTenants = JSON.parse(tenancy.tenants);
-      tenantsList = parsedTenants.map(t => t.name).join(', ');
-      rentAmount = tenancy.rent_amount.toLocaleString('en-GB', { minimumFractionDigits: 2 });
-      const parsedDep = JSON.parse(tenancy.deposit);
-      depositAmount = (parsedDep.amount || 0).toLocaleString('en-GB', { minimumFractionDigits: 2 });
-      schemeName = parsedDep.scheme || schemeName;
-    }
-
-    // Replace template placeholders
-    let content = template.content_template;
+    // Only real data or what the landlord typed. Anything missing stays a visible placeholder:
+    // a notice must never contain invented amounts, dates or evidence.
+    const add = (what) => `[ADD: ${what}]`;
+    const money = (n) => (typeof n === 'number' && n > 0 ? n.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null);
+    const deposit = tenancy ? JSON.parse(tenancy.deposit) : null;
+    const rent = tenancy ? Number(tenancy.rent_amount) : null;
+    const cv = (k) => (typeof custom_values[k] === 'string' && custom_values[k].trim() ? custom_values[k].trim() : null);
+    const epc = db.prepare("SELECT rating FROM certificates WHERE property_id = ? AND type = 'epc' ORDER BY expiry_date DESC").get(property.id);
     const values = {
-      property_address: property ? `${property.address_line1}, ${property.city} ${property.postcode}` : '14b Camden Road, London NW1 9HL',
-      tenant_names: tenantsList,
-      start_date: tenancy ? tenancy.start_date : '2026-05-01',
-      rent_amount: rentAmount,
-      deposit_amount: depositAmount,
-      deposit_limit: (parseFloat(rentAmount.replace(/,/g, '')) * 12 / 52 * 5).toFixed(2),
-      scheme_name: schemeName,
-      current_rent: rentAmount,
-      new_rent: custom_values?.new_rent || (parseFloat(rentAmount.replace(/,/g, '')) * 1.05).toFixed(2),
-      effective_date: custom_values?.effective_date || '2027-01-01',
-      last_increase_date: tenancy?.rent_last_increased_date || '2025-06-01',
-      market_evidence: custom_values?.market_evidence || 'Based on comparable local 2-bedroom rental listings within 0.5 miles over past 60 days averaging £2,050/month.',
-      pet_description: custom_values?.pet_description || 'One domestic medium-sized cat (neutered and microchipped).',
-      request_date: custom_values?.request_date || '2026-11-10',
-      response_date: new Date().toISOString().split('T')[0],
-      refusal_reasons: custom_values?.refusal_reasons || 'N/A - Conditional consent granted.',
-      reported_date: custom_values?.reported_date || '2026-11-12',
-      ack_date: '2026-11-13',
-      inspection_date: custom_values?.inspection_date || '2026-11-16',
-      contractor_appointed: custom_values?.contractor_appointed || 'Apex Specialist Environmental Surveys',
-      work_start_date: '2026-11-20',
-      completion_date: 'Pending completion',
-      issue_description: custom_values?.issue_description || 'Condensation mould reported along external bedroom north wall.',
-      served_date: new Date().toISOString().split('T')[0],
-      epc_rating: 'B (82)'
+      property_address: `${property.address_line1}${property.address_line2 ? ', ' + property.address_line2 : ''}, ${property.city} ${property.postcode}`,
+      tenant_names: tenancy ? JSON.parse(tenancy.tenants).map((t) => t.name).join(', ') : add('tenant name(s)'),
+      start_date: tenancy?.start_date || add('tenancy start date'),
+      rent_amount: money(rent) || add('current rent'),
+      current_rent: money(rent) || add('current rent'),
+      deposit_amount: money(deposit?.amount) || add('deposit amount'),
+      deposit_limit: rent ? ((rent * 12) / 52 * 5).toFixed(2) : add('deposit cap (5 weeks’ rent)'),
+      scheme_name: deposit?.scheme || add('deposit protection scheme'),
+      new_rent: cv('new_rent') || add('proposed new rent'),
+      effective_date: cv('effective_date') || add('date the new rent starts (at least 2 months after serving)'),
+      last_increase_date: tenancy?.rent_last_increased_date || cv('last_increase_date') || add('date of the last rent increase'),
+      market_evidence: cv('market_evidence') || add('evidence of comparable local rents'),
+      pet_description: cv('pet_description') || add('description of the pet requested'),
+      request_date: cv('request_date') || add('date the tenant made the request'),
+      response_date: isoDay(new Date()),
+      refusal_reasons: cv('refusal_reasons') || add('decision and reasons'),
+      reported_date: cv('reported_date') || add('date the issue was reported'),
+      ack_date: cv('ack_date') || add('date you acknowledged the report'),
+      inspection_date: cv('inspection_date') || add('inspection date'),
+      contractor_appointed: cv('contractor_appointed') || add('contractor name'),
+      work_start_date: cv('work_start_date') || add('date works start'),
+      completion_date: cv('completion_date') || add('expected completion date'),
+      issue_description: cv('issue_description') || add('description of the hazard'),
+      served_date: isoDay(new Date()),
+      epc_rating: epc?.rating || add('EPC rating'),
     };
+    let content = template.content_template;
+    for (const [k, v] of Object.entries(values)) content = content.replaceAll(`{{${k}}}`, v);
+    const missing = (content.match(/\[ADD: [^\]]+\]/g) || []).length;
 
-    for (const [key, val] of Object.entries(values)) {
-      content = content.replaceAll(`{{${key}}}`, val);
-    }
-
-    const docId = 'doc-' + uuidv4().slice(0, 8);
-    db.prepare(`
-      INSERT INTO documents (id, property_id, template_id, title, category, content)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      docId,
-      property_id,
-      template.id,
-      `${template.name} - ${property ? property.address_line1 : 'Property'}`,
-      template.category,
-      content
-    );
-
-    const docRecord = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId);
+    const docId = 'doc-' + uuidv4();
+    db.prepare('INSERT INTO documents (id, property_id, template_id, title, category, content) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(docId, property.id, template.id, `${template.name} - ${property.address_line1}`, template.category, content);
     res.json({
       success: true,
-      document: docRecord,
+      document: db.prepare('SELECT * FROM documents WHERE id = ?').get(docId),
+      missing_fields: missing,
       official_gov_url: template.official_gov_url,
-      guidance_text: template.guidance_text
+      guidance_text: template.guidance_text,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.get('/documents', (req, res) => {
   try {
     const { property_id } = req.query;
-    let query = 'SELECT * FROM documents';
-    const params = [];
-    if (property_id) {
-      query += ' WHERE property_id = ?';
-      params.push(property_id);
-    }
-    query += ' ORDER BY created_at DESC';
-    const docs = db.prepare(query).all(...params);
-    res.json({ success: true, documents: docs });
+    const rows = property_id
+      ? db.prepare('SELECT d.* FROM documents d JOIN properties p ON d.property_id = p.id WHERE p.user_id = ? AND d.property_id = ? ORDER BY d.created_at DESC').all(req.user.id, property_id)
+      : db.prepare('SELECT d.* FROM documents d JOIN properties p ON d.property_id = p.id WHERE p.user_id = ? ORDER BY d.created_at DESC').all(req.user.id);
+    res.json({ success: true, documents: rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 9. "CAN I DO THIS?" LEGAL ASSISTANT
-// ----------------------------------------------------
-router.post('/qa', (req, res) => {
+// 8. "CAN I DO THIS?" (rules-based, not legal advice) ----------
+router.post('/qa', requirePlan, (req, res) => {
   try {
-    const { question, property_id } = req.body;
-    if (!question || !question.trim()) {
-      return res.status(400).json({ success: false, error: 'A question is required.' });
-    }
-
-    const rules = db.prepare('SELECT * FROM rules').all();
-    let propertyContext = null;
-    if (property_id) {
-      propertyContext = db.prepare('SELECT * FROM properties WHERE id = ?').get(property_id);
-    }
-
-    const result = answerLandlordQuestion(question, propertyContext, rules);
-
-    const logId = 'qa-' + uuidv4().slice(0, 8);
-    db.prepare(`
-      INSERT INTO qa_logs (id, user_id, property_id, question, answer, relevant_rule_ids, solicitor_advised)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      logId,
-      DEFAULT_USER_ID,
-      property_id || null,
-      question,
-      result.answer,
-      JSON.stringify(result.relevant_rules.map(r => r.id)),
-      result.solicitor_advised
-    );
-
-    res.json({
-      success: true,
-      qa_log_id: logId,
-      result
-    });
+    const { question, property_id } = req.body || {};
+    if (!question || !String(question).trim()) return res.status(400).json({ success: false, error: 'A question is required.' });
+    const property = property_id ? ownProperty(req.user.id, property_id) : null;
+    const result = answerLandlordQuestion(String(question).slice(0, 2000), property, db.prepare('SELECT * FROM rules').all());
+    const logId = 'qa-' + uuidv4();
+    db.prepare('INSERT INTO qa_logs (id, user_id, property_id, question, answer, relevant_rule_ids, solicitor_advised) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(logId, req.user.id, property?.id || null, question, result.answer, JSON.stringify(result.relevant_rules.map((r) => r.id)), result.solicitor_advised);
+    res.json({ success: true, qa_log_id: logId, result });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
 router.get('/qa', (req, res) => {
   try {
     const { property_id } = req.query;
-    let query = 'SELECT * FROM qa_logs';
-    const params = [];
-    if (property_id) {
-      query += ' WHERE property_id = ?';
-      params.push(property_id);
-    }
-    query += ' ORDER BY created_at DESC';
-    const logs = db.prepare(query).all(...params);
-    res.json({
-      success: true,
-      logs: logs.map(l => ({
-        ...l,
-        relevant_rule_ids: l.relevant_rule_ids ? JSON.parse(l.relevant_rule_ids) : []
-      }))
-    });
+    const logs = property_id
+      ? db.prepare('SELECT * FROM qa_logs WHERE user_id = ? AND property_id = ? ORDER BY created_at DESC').all(req.user.id, property_id)
+      : db.prepare('SELECT * FROM qa_logs WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id);
+    res.json({ success: true, logs: logs.map((l) => ({ ...l, relevant_rule_ids: l.relevant_rule_ids ? JSON.parse(l.relevant_rule_ids) : [] })) });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 
-// ----------------------------------------------------
-// 10. REGULATION UPDATES FEED & ADMIN BROADCAST
-// ----------------------------------------------------
-router.get('/regulation-updates', (req, res) => {
-  try {
-    const updates = db.prepare('SELECT * FROM regulation_updates ORDER BY effective_date DESC').all();
-    res.json({
-      success: true,
-      updates: updates.map(u => ({
-        ...u,
-        actions_required: u.actions_required ? JSON.parse(u.actions_required) : []
-      }))
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
+// 9. REGULATION UPDATE BROADCAST (operators only: ADMIN_EMAILS) ---
 router.post('/regulation-updates', (req, res) => {
   try {
-    const { title, summary, topic, effective_date, affected_regions, impact_severity, source_url, actions_required } = req.body;
-    if (!title || !summary || !topic) {
-      return res.status(400).json({ success: false, error: 'Title, summary, and topic are required.' });
+    const admins = (process.env.ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+    if (!admins.includes(String(req.user.email).toLowerCase())) return res.status(403).json({ success: false, error: 'Only the LandlordReady team can publish regulation updates.' });
+    const b = req.body || {};
+    if (!b.title || !b.summary || !b.topic || !b.effective_date || !b.source_url) {
+      return res.status(400).json({ success: false, error: 'Title, summary, topic, effective date and official source URL are required.' });
     }
-
-    const updateId = 'upd-' + uuidv4().slice(0, 8);
-    const actionsJson = JSON.stringify(actions_required || [
-      'Review portfolio properties in affected local authorities',
-      'Update compliance documents to reflect latest statutory guidance'
-    ]);
-
-    db.prepare(`
-      INSERT INTO regulation_updates (id, title, summary, topic, effective_date, affected_regions, impact_severity, source_url, actions_required, broadcast_sent)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(
-      updateId,
-      title,
-      summary,
-      topic,
-      effective_date || '2026-10-01',
-      affected_regions || 'England (All Regions)',
-      impact_severity || 'medium',
-      source_url || 'https://www.gov.uk/government/publications/guide-to-the-renters-rights-bill',
-      actionsJson
-    );
-
-    // Auto-create new compliance tasks for affected user properties!
-    const properties = db.prepare('SELECT * FROM properties WHERE user_id = ?').all(DEFAULT_USER_ID);
-    const createdTasks = [];
-    const insertTask = db.prepare(`
-      INSERT INTO tasks (id, property_id, type, title, description, due_date, status, priority)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    `);
-
+    const actions = Array.isArray(b.actions_required) ? b.actions_required : [];
+    const updateId = 'upd-' + uuidv4();
+    db.prepare(`INSERT INTO regulation_updates (id, title, summary, topic, effective_date, affected_regions, impact_severity, source_url, actions_required, broadcast_sent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+      .run(updateId, b.title, b.summary, b.topic, b.effective_date, b.affected_regions || 'England', b.impact_severity || 'medium', b.source_url, JSON.stringify(actions));
+    // One task per property for every landlord.
+    const properties = db.prepare('SELECT id FROM properties').all();
     for (const p of properties) {
-      const taskId = 'tsk-' + uuidv4().slice(0, 8);
-      const taskTitle = `Action Required: ${title}`;
-      const taskDesc = `Statutory update: ${summary}. Actions: ${(actions_required || []).join('; ')}`;
-      insertTask.run(taskId, p.id, 'statutory_update', taskTitle, taskDesc, effective_date || '2026-12-01', impact_severity === 'high' ? 'urgent' : 'medium');
-      createdTasks.push({ taskId, property_id: p.id, title: taskTitle });
+      addTask({ property_id: p.id, type: 'statutory_update', title: `Regulation change: ${b.title}`, description: `${b.summary}${actions.length ? ` Actions: ${actions.join('; ')}` : ''} Source: ${b.source_url}`, due_date: b.effective_date, priority: b.impact_severity === 'high' ? 'urgent' : 'medium' });
     }
-
-    res.json({
-      success: true,
-      update_id: updateId,
-      tasks_created_count: createdTasks.length,
-      message: `Regulation update broadcasted successfully. Auto-created ${createdTasks.length} compliance tasks for your portfolio.`
-    });
+    res.json({ success: true, update_id: updateId, tasks_created_count: properties.length });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    fail(res, err);
   }
 });
 

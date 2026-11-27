@@ -5,14 +5,14 @@ import {
 } from 'lucide-react';
 import { api } from '../services/api';
 
-export function PricingPage({ profile, subscription, onRefresh, setActiveTab }) {
+export function PricingPage({ profile, subscription, onRefresh, setActiveTab, signedIn = false }) {
   const [billingCycle, setBillingCycle] = useState(subscription?.billing_cycle || 'monthly');
   const [upgradingPlan, setUpgradingPlan] = useState(null);
   const [orders, setOrders] = useState([]);
 
   useEffect(() => {
-    loadOrders();
-  }, []);
+    if (signedIn) loadOrders();
+  }, [signedIn]);
 
   const loadOrders = async () => {
     try {
@@ -24,16 +24,32 @@ export function PricingPage({ profile, subscription, onRefresh, setActiveTab }) 
   };
 
   const handleUpgrade = async (planId) => {
+    if (!signedIn) {
+      setActiveTab('login');
+      return;
+    }
     setUpgradingPlan(planId);
     try {
-      const res = await api.upgradeSubscription(planId, billingCycle);
-      alert(res.message);
+      const res = await api.checkout(planId, billingCycle);
+      if (res.checkout_url) {
+        window.location.href = res.checkout_url; // secure Dodo Payments checkout
+        return;
+      }
+      alert(res.message || 'Plan updated.');
       onRefresh();
-      loadOrders();
     } catch (err) {
-      alert('Upgrade error: ' + err.message);
+      alert(err.message);
     } finally {
       setUpgradingPlan(null);
+    }
+  };
+
+  const openBilling = async () => {
+    try {
+      const res = await api.billingPortal();
+      window.location.href = res.url;
+    } catch (err) {
+      alert(err.message);
     }
   };
 
@@ -235,7 +251,7 @@ export function PricingPage({ profile, subscription, onRefresh, setActiveTab }) 
                       <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                     ) : (
                       <>
-                        <span>Start 14-Day Free Trial</span>
+                        <span>{signedIn ? (subscription?.plan_id === p.id ? 'Current plan' : 'Choose plan') : 'Start 14-Day Free Trial'}</span>
                         <ArrowRight className="w-3.5 h-3.5 ml-1" />
                       </>
                     )}
@@ -269,8 +285,12 @@ export function PricingPage({ profile, subscription, onRefresh, setActiveTab }) 
             <tbody className="divide-y divide-slate-100">
               {orders.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-6 text-center text-slate-400">
-                    No previous invoices found.
+                  <td colSpan={6} className="py-6 text-center text-slate-500">
+                    {subscription?.has_billing ? (
+                      <button onClick={openBilling} className="font-semibold text-sky-700 underline">Manage billing, invoices and cancellation</button>
+                    ) : (
+                      'Invoices appear in your billing portal after your first payment.'
+                    )}
                   </td>
                 </tr>
               ) : (
